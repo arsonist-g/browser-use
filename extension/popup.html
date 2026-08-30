@@ -1,0 +1,78 @@
+<!doctype html>
+<!-- 按前端设计原型实现:project-memory/spec/frontend-design/browser-use-bridge-popup/popup.html -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  :root{
+    --bg:#16181d; --surface:#1f2229; --border:#2c313a;
+    --text:#e8eaee; --text-2:#9aa3af;
+    --ok:#2fbf71; --warn:#e0a52e; --err:#ef5a5f; --accent:#6b93ff;
+    --r-ctl:6px; --r-card:10px; --pad:12px;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7f9; --surface:#fff; --border:#d9dde3;
+      --text:#1a1d22; --text-2:#5c6470;
+      --ok:#1a7f4b; --warn:#b07a00; --err:#c2373c; --accent:#2456d6; }
+  }
+  *{ box-sizing:border-box; margin:0; }
+  body{ width:360px; background:var(--bg); color:var(--text);
+        font:13px/1.45 system-ui,"Segoe UI",sans-serif; padding:var(--pad); }
+  .card{ background:var(--surface); border:1px solid var(--border);
+         border-radius:var(--r-card); padding:var(--pad); }
+  .card + .card{ margin-top:8px; }
+  .status{ display:flex; align-items:center; gap:8px; }
+  .dot{ width:10px; height:10px; border-radius:50%; flex:none; }
+  .dot.ok{ background:var(--ok); animation:breath 2s ease-in-out infinite; }
+  .dot.err{ background:var(--err); } .dot.warn{ background:var(--warn); }
+  @keyframes breath{ 50%{ opacity:.35; } }
+  @media (prefers-reduced-motion: reduce){ .dot.ok{ animation:none; } }
+  h1{ font-size:15px; font-weight:600; }
+  .sub{ color:var(--text-2); font-size:12px; margin-top:2px; }
+  .sec{ margin-top:var(--pad); }
+  .sec > .label{ font-size:12px; color:var(--text-2); margin-bottom:6px; }
+  input{ width:100%; padding:8px 10px; font:12px ui-monospace,Consolas,monospace;
+         color:var(--text); background:var(--bg);
+         border:1px solid var(--border); border-radius:var(--r-ctl); }
+  input:focus{ outline:1px solid var(--accent); border-color:var(--accent); }
+  .row{ display:flex; gap:8px; margin-top:8px; }
+  button{ flex:none; padding:7px 12px; border-radius:var(--r-ctl);
+          border:1px solid var(--border); background:var(--surface);
+          color:var(--text); cursor:pointer; }
+  button.primary{ background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .kv{ display:flex; justify-content:space-between; font-size:12px; padding:3px 0; }
+  .kv .k{ color:var(--text-2); } .kv .v{ font-family:ui-monospace,Consolas,monospace; }
+  .msg{ margin-top:6px; font-size:12px; }
+  .msg.ok{ color:var(--ok); } .msg.err{ color:var(--err); }
+</style>
+</head>
+<body>
+  <div class="card status">
+    <span class="dot" id="dot"></span>
+    <div>
+      <h1>Browser-Use Bridge</h1>
+      <div class="sub" id="statusText">检查中…</div>
+    </div>
+  </div>
+
+  <div class="card sec">
+    <div class="label">配对 token(browser-use extension 输出)</div>
+    <input id="token" placeholder="粘贴 64 位 token" autocomplete="off" spellcheck="false">
+    <div class="row">
+      <button class="primary" id="save">保存并重连</button>
+      <button id="reconnect">立即重连</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="kv"><span class="k">扩展版本</span><span class="v" id="extV"></span></div>
+    <div class="kv"><span class="k">协议</span><span class="v">v1</span></div>
+    <div class="kv"><span class="k">daemon</span><span class="v" id="daemonV">—</span></div>
+  </div>
+
+<script src="popup.js"></script>
+</body>
+</html>

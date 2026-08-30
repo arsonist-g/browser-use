@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+*.egg-info/
+.tmp/
+daemon.log*
+profiles/
+tmp-doc/
+project-memory/
+*.heapsnapshot
