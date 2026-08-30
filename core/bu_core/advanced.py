@@ -206,24 +206,21 @@ def trigger_extension_action(sess, args, session_dir):
 # ---- lighthouse_audit(Lighthouse CLI attach 已运行调试端口实例,源码级证实) ----
 
 def lighthouse_audit(sess, args, session_dir):
-    """spawn lighthouse CLI attach 本会话调试端口;node/lighthouse 未装时报清晰错误。"""
+    """spawn lighthouse CLI attach 本会话调试端口(npx --yes 自动拉取,实测通过)。"""
     import subprocess
     port = sess.port
     url = sess.t.run_js("return location.href")
     if not url or url.startswith(("edge://", "chrome://", "about:", "file://")):
         raise ValueError("lighthouse 需要一个 http(s) 页面(先 navigate)")
     only = args.get("onlyCategories") or "accessibility,seo,best-practices"
-    out_path = sess.artifact_path(session_dir, "lighthouse", "json")
+    out_path = sess.artifact_path(session_dir, "lighthouse", "json").replace("\\", "/")
     cmd = ["npx", "--yes", "lighthouse", url,
-           "--port", str(port), "--output", "json",
+           "--port", str(port),
+           "--output", "json",
            "--only-categories", only,
-           "--output-path", out_path,
-           "--chrome-flags", '"--headless=new"']
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
-                              shell=(os.name == "nt"))
-    except FileNotFoundError:
-        raise RuntimeError("lighthouse 未安装:npm i -g lighthouse(npx 可自动拉取但首次较慢)")
+           "--output-path", out_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                          shell=(os.name == "nt"))
     if proc.returncode != 0 or not os.path.exists(out_path):
         raise RuntimeError(f"lighthouse 执行失败: {(proc.stderr or proc.stdout)[-300:]}")
     with open(out_path, encoding="utf-8") as f:
