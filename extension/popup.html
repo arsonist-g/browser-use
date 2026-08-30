@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- 按前端设计原型实现:project-memory/spec/frontend-design/browser-use-bridge-popup/popup.html -->
+<!-- Browser-Use Bridge popup(无感配对版,DEC-012:无 token 交互,纯状态展示) -->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -30,22 +30,14 @@
   @media (prefers-reduced-motion: reduce){ .dot.ok{ animation:none; } }
   h1{ font-size:15px; font-weight:600; }
   .sub{ color:var(--text-2); font-size:12px; margin-top:2px; }
-  .sec{ margin-top:var(--pad); }
-  .sec > .label{ font-size:12px; color:var(--text-2); margin-bottom:6px; }
-  input{ width:100%; padding:8px 10px; font:12px ui-monospace,Consolas,monospace;
-         color:var(--text); background:var(--bg);
-         border:1px solid var(--border); border-radius:var(--r-ctl); }
-  input:focus{ outline:1px solid var(--accent); border-color:var(--accent); }
-  .row{ display:flex; gap:8px; margin-top:8px; }
-  button{ flex:none; padding:7px 12px; border-radius:var(--r-ctl);
+  .row{ display:flex; gap:8px; margin-top:10px; }
+  button{ padding:7px 12px; border-radius:var(--r-ctl);
           border:1px solid var(--border); background:var(--surface);
           color:var(--text); cursor:pointer; }
-  button.primary{ background:var(--accent); border-color:var(--accent); color:#fff; }
   button:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
   .kv{ display:flex; justify-content:space-between; font-size:12px; padding:3px 0; }
   .kv .k{ color:var(--text-2); } .kv .v{ font-family:ui-monospace,Consolas,monospace; }
-  .msg{ margin-top:6px; font-size:12px; }
-  .msg.ok{ color:var(--ok); } .msg.err{ color:var(--err); }
+  .msg{ margin-top:6px; font-size:12px; color:var(--text-2); }
 </style>
 </head>
 <body>
@@ -57,14 +49,11 @@
     </div>
   </div>
 
-  <div class="card sec">
-    <div class="label">配对 token(browser-use extension 输出)</div>
-    <input id="token" placeholder="粘贴 64 位 token" autocomplete="off" spellcheck="false">
-    <div class="row">
-      <button class="primary" id="save">保存并重连</button>
+  <div class="card">
+    <div class="row" style="margin-top:0">
       <button id="reconnect">立即重连</button>
     </div>
-    <div class="msg" id="msg"></div>
+    <div class="msg" id="msg">daemon 在线时自动连接,无需任何配置。</div>
   </div>
 
   <div class="card">

@@ -5,21 +5,15 @@ const DAEMON_WS = "ws://127.0.0.1:17990";
 let ws = null;
 let backoffMs = 1000;
 
-async function getToken() {
-  const { bridgeToken } = await chrome.storage.local.get("bridgeToken");
-  return bridgeToken ?? "";
-}
-
 function setUiState(state, detail) {
   chrome.storage.local.set({ uiState: state, uiDetail: detail ?? "" });
 }
 
 async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  const token = await getToken();
-  if (!token) { setUiState("error", "未配对:先运行 browser-use extension 获取 token"); return; }
+  // 无感配对(DEC-012):回环即信任,daemon 在线即自动连接,零交互
   try {
-    ws = new WebSocket(`${DAEMON_WS}?token=${encodeURIComponent(token)}&proto=1`);
+    ws = new WebSocket(`${DAEMON_WS}?proto=1`);
   } catch (e) {
     setUiState("disconnected", String(e));
     scheduleReconnect();
@@ -48,7 +42,7 @@ async function connect() {
   };
   ws.onclose = (ev) => {
     ws = null;
-    if (ev.code === 4001) { setUiState("error", "token 不匹配:重新复制 browser-use extension 的 token"); return; }
+    if (ev.code === 4002) { setUiState("error", "协议版本不匹配:请更新扩展或 daemon"); return; }
     setUiState("disconnected", "daemon 不可达,自动重连中");
     scheduleReconnect();
   };
@@ -63,14 +57,6 @@ function scheduleReconnect() {
 chrome.alarms.create("reconnect", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(() => { if (!ws || ws.readyState !== WebSocket.OPEN) connect(); });
 chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
-  if (msg?.type === "saveToken") {
-    chrome.storage.local.set({ bridgeToken: msg.token }, () => {
-      if (ws) { try { ws.close(); } catch { /* */ } ws = null; }
-      connect();
-      sendResponse({ ok: true });
-    });
-    return true;
-  }
   if (msg?.type === "reconnect") {
     if (ws) { try { ws.close(); } catch { /* */ } ws = null; }
     connect();

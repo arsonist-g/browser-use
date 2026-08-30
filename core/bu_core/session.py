@@ -27,9 +27,16 @@ class BrowserSession:
             co.set_browser_path(self.browser_exe)
         co.set_local_port(self.port)
         co.set_user_data_path(self.profile)
-        # Edge 首启/同步类弹窗会抢占标签页甚至模态阻塞 CDP,全面禁用(不影响指纹语义)
+        # 扩展白名单(默认空 = 全禁;白名单机制 Should,实现后此处按白名单传 --disable-extensions-except)
+        whitelist = self._whitelist_paths()
+        if whitelist:
+            co.set_argument("--disable-extensions-except", "|".join(whitelist))
+        else:
+            co.set_argument("--disable-extensions")
+        # Edge 首启/同步/更新提示类弹窗与页面全面禁用(不影响指纹语义)
         co.set_argument("--disable-features",
-                        "msFirstRunExperience,msSeamlessWebToBrowserSignIn,msImplicitSignin")
+                        "msFirstRunExperience,msSeamlessWebToBrowserSignIn,msImplicitSignin,"
+                        "EdgeWelcomePage,EdgeUpdateToast,msEdgeUpdateToast")
         if self.headless:
             co.headless()
         self.browser = Chromium(co)
@@ -68,14 +75,22 @@ class BrowserSession:
             self.tab = tabs[0]
         return self.tab
 
+    def _whitelist_paths(self):
+        """白名单扩展目录(Should 机制;首版无实现,恒空 = 全禁扩展)。"""
+        return []
+
     def prune_edge_popups(self):
-        """关掉 Edge 自动的同步确认/首启类弹窗页(它们不是任务页)。"""
+        """关掉一切浏览器内建页(welcome/同步确认/更新提示等)——它们不是任务页。"""
         try:
             for t in self.browser.get_tabs():
-                u = t.url or ""
-                if u.startswith("edge://sync-confirmation") or u.startswith("edge://first-run") \
-                   or u.startswith("chrome://sync-confirmation") or u.startswith("edge://post-setup"):
-                    self.browser.close_tabs(t)
+                u = (t.url or "").lower()
+                if u.startswith(("edge://", "chrome://", "about:", "edge-netinternal://")):
+                    tabs = self.browser.get_tabs()
+                    if len(tabs) > 1:
+                        self.browser.close_tabs(t)
+                    else:
+                        # 只剩内建页时导航到空白页兜底(不留在欢迎页)
+                        t.get("about:blank")
         except Exception:
             pass
 

@@ -181,10 +181,8 @@ usage:
       }
       case "extension": {
         const extDir = path.join(ROOT, "extension");
-        const { loadBridgeToken } = await import("../lib/config.mjs");
-        const token = loadBridgeToken();
-        if (jsonMode) return outJson({ extension_dir: extDir, token });
-        out(`extension_dir: ${extDir}\ntoken: ${token}\n\n步骤: edge://extensions → 开发者模式 → 加载解压缩的扩展(${extDir})→ 打开扩展 popup 粘贴 token 保存。`);
+        if (jsonMode) return outJson({ extension_dir: extDir });
+        out(`extension_dir: ${extDir}\n\n步骤: edge://extensions → 开发者模式 → 加载解压缩的扩展(${extDir})。无感配对:daemon 在线时自动连接,无需任何配置。`);
         return;
       }
       case "doctor": {
