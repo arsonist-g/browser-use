@@ -330,8 +330,13 @@ def get_console_message(sess, args, session_dir):
 
 
 def list_network_requests(sess, args, session_dir):
-    """收割模式:返回自上次调用以来新捕获的请求(listen 于会话启动即开启)。"""
+    """收割模式:返回自上次调用以来新捕获的请求(DP 导航会自动停监听,惰性重启)。"""
     t = sess.t
+    try:
+        t.listen.start()
+    except Exception:
+        pass  # 已启动/导航后自动停止:幂等重启
+    sess.listen_started = True
     packets = []
     for p in t.listen.steps(timeout=0.5):
         packets.append(p)
@@ -346,6 +351,10 @@ def list_network_requests(sess, args, session_dir):
 def get_network_request(sess, args, session_dir):
     t = sess.t
     idx = int(args["reqid"])
+    try:
+        t.listen.start()
+    except Exception:
+        pass
     packets = list(t.listen.steps(count=None, timeout=0.2))
     p = packets[idx]
     body = None
@@ -383,3 +392,14 @@ def emulate(sess, args, session_dir):
 def scroll_unknown_state(sess, args, session_dir):
     from .snapshot import settle_check
     return settle_check(sess)
+
+
+# ---- M2/M3 挂载(performance/memory/advanced)——57 工具全量注册 ----
+from . import performance as _perf  # noqa: E402
+from . import memory as _mem  # noqa: E402
+from . import advanced as _adv  # noqa: E402
+
+for _mod in (_perf, _mem, _adv):
+    for _name in dir(_mod):
+        if not _name.startswith("_") and callable(getattr(_mod, _name)):
+            globals()[_name] = getattr(_mod, _name)

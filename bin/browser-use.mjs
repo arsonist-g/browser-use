@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // Browser-Use CLI(AI 调用面;bin: browser-use)
 // 命令面契约见 backend-design/api-contract.md §6;工具名/参数对齐 chrome-devtools-mcp v1.8.0
-import { parseArgs } from "node:util";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -18,7 +17,11 @@ const TOOL_POS = {
   handle_dialog: ["action"], navigate_page: ["url"], new_page: ["url"],
   select_page: ["page_id"], close_page: ["page_id"], wait_for: ["text"],
   evaluate_script: ["function"], get_network_request: ["reqid"], get_console_message: ["msgid"],
-  take_screenshot: [], take_snapshot: [], scroll: [],
+  take_screenshot: [], take_snapshot: [], scroll: [], click_at: ["x", "y"],
+  resize_page: ["width", "height"], execute_3p_developer_tool: ["tool"],
+  get_heapsnapshot_details: ["name"],
+  get_heapsnapshot_edges: ["node_index"], get_heapsnapshot_retainers: ["node_index"],
+  get_heapsnapshot_retaining_paths: ["node_index"], get_heapsnapshot_object_details: ["node_index"],
 };
 const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
   "headless", "bringToFront", "fix"]);
@@ -96,6 +99,25 @@ function fmtResult(tool, r) {
 // ---- commands ----
 async function main() {
   const argv = process.argv.slice(2);
+  // 通用解析:--flag value / --boolFlag / 位置参数(工具参数各异,不再逐一声明)
+  const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
+    "headless", "bringToFront", "fix"]);
+  const values = {};   // flags
+  const positionals = [];
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      let key = a.slice(2), val;
+      const eq = key.indexOf("=");
+      if (eq >= 0) { val = key.slice(eq + 1); key = key.slice(0, eq); }
+      if (BOOL_FLAGS.has(key)) values[key] = true;
+      else if (eq >= 0) values[key] = val;
+      else if (i + 1 >= argv.length || argv[i + 1].startsWith("--")) values[key] = true;
+      else { values[key] = argv[i + 1]; i++; }
+    } else {
+      positionals.push(a);
+    }
+  }
   const command = argv[0];
   if (!command || command === "--help" || command === "-h" || command === "help") {
     out(`browser-use ${VERSION}
@@ -110,21 +132,6 @@ usage:
   browser-use doctor [--fix]`);
     return;
   }
-
-  const { values, positionals } = parseArgs({
-    args: argv.slice(1), allowPositionals: true,
-    options: {
-      session: { type: "string" }, headless: { type: "boolean" },
-      "browser-exe": { type: "string" }, state: { type: "string" },
-      "output-format": { type: "string", default: "md" }, timeout: { type: "string" },
-      url: { type: "string" }, uid: { type: "string" }, value: { type: "string" },
-      key: { type: "string" }, text: { type: "string" }, direction: { type: "string" },
-      amount: { type: "string" }, action: { type: "string" }, type: { type: "string" },
-      pageId: { type: "string" }, reqid: { type: "string" }, includeSnapshot: { type: "boolean" },
-      dblClick: { type: "boolean" }, fullPage: { type: "boolean" }, verbose: { type: "boolean" },
-      filePath: { type: "string" }, fix: { type: "boolean" },
-    },
-  });
 
   const jsonMode = values["output-format"] === "json";
   const need = () => { if (!values.session) die(2, "需要 --session=<id>(由 start 输出)"); return values.session; };
@@ -195,10 +202,9 @@ usage:
         const args = {};
         const pos = TOOL_POS[command] ?? [];
         pos.forEach((k, i) => { if (positionals[i] !== undefined) args[k] = positionals[i]; });
-        const flagMap = { pageId: "page_id", "browser-exe": "browser_exe" };
         for (const [k, v] of Object.entries(values)) {
-          if (v === undefined || k === "output-format" || k === "session" || k === "timeout") continue;
-          args[flagMap[k] ?? k] = (BOOL_FLAGS.has(k)) ? !!v : (typeof v === "string" && v !== "" && !isNaN(Number(v)) && !["url"].includes(k) ? v : v);
+          if (v === undefined || k === "output-format" || k === "session" || k === "timeout" || k === "fix") continue;
+          args[k.replace(/-/g, "_")] = v;   // kebab → snake(--snapshot-id → snapshot_id)
         }
         const r = await rpc("tool.call", { session_id: sid, tool: command, args });
         if (jsonMode) return outJson(r);

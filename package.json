@@ -16,6 +16,7 @@
   "scripts": {
     "start": "node bin/browser-use.mjs",
     "test": "node --test test/unit/core.test.mjs",
-    "e2e": "node test/e2e.mjs"
+    "e2e": "node test/e2e.mjs",
+    "all-tools": "node test/all-tools.mjs"
   }
 }
