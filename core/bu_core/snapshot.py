@@ -93,7 +93,7 @@ def build_snapshot(sess, verbose=False):
 
 
 _SCROLL_JS = """
-(() => {
+return (() => {
   const out = [];
   const els = [document.scrollingElement, document.documentElement,
                ...document.querySelectorAll('div,main,section,article,aside,nav,iframe')];

@@ -1,0 +1,163 @@
+<!doctype html>
+<!-- Browser-Use 测试夹具页:覆盖 P0 工具面的全部可测能力。
+     设计原则:每个交互都把结果写进 #log(文本可被 take_snapshot 断言)。
+     区域:基础元素 / 表单 / shadow-root(open+closed) / 动态重建(uid 失效) /
+           滚动容器+懒加载 / iframe / dialog / 上传 / 新窗口 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>BU Fixture</title>
+<style>
+  body { font: 14px/1.5 system-ui; margin: 16px; }
+  section { border: 1px solid #ccc; padding: 8px; margin: 12px 0; }
+  #inner-scroll { height: 200px; overflow-y: auto; border: 1px dashed #999; }
+  #inner-scroll .row { height: 60px; }
+  #lazy-zone .lazy-item { height: 40px; background: #eef; margin: 4px 0; }
+  table { border-collapse: collapse; }
+  td, th { border: 1px solid #999; padding: 4px 10px; }
+</style>
+</head>
+<body>
+<h1>BU Fixture 主页</h1>
+<p id="intro">Browser-Use 自动化测试夹具。所有交互结果写入日志区。</p>
+
+<section id="sec-basic">
+  <h2>基础元素</h2>
+  <button id="btn-log" onclick="log('basic-button-clicked')">基础按钮</button>
+  <a id="link-iana" href="https://www.iana.org/help/example-domains">外链</a>
+  <a id="link-newtab" href="child.html" target="_blank">新窗口打开子页</a>
+</section>
+
+<section id="sec-form">
+  <h2>表单</h2>
+  <label>姓名 <input id="f-name" type="text" placeholder="姓名"></label>
+  <label>城市
+    <select id="f-city">
+      <option value="">--选择--</option>
+      <option value="bj">北京</option>
+      <option value="sh">上海</option>
+      <option value="sz">深圳</option>
+    </select>
+  </label>
+  <label><input id="f-agree" type="checkbox"> 同意条款</label>
+  <label>简介 <textarea id="f-bio" rows="2"></textarea></label>
+  <label>附件 <input id="f-file" type="file" aria-label="附件上传"></label>
+  <button id="btn-submit" onclick="submitForm()">提交表单</button>
+  <div id="form-result">(尚未提交)</div>
+</section>
+
+<section id="sec-shadow">
+  <h2>Shadow Root(open 与 closed)</h2>
+  <div id="shadow-open-host"></div>
+  <div id="shadow-closed-host"></div>
+  <div id="shadow-result">(shadow 按钮未点击)</div>
+</section>
+
+<section id="sec-dyn">
+  <h2>动态重建(uid 失效场景)</h2>
+  <ul id="dyn-list"><li>item-a</li><li>item-b</li></ul>
+  <button id="btn-rebuild" onclick="rebuildList()">重建列表</button>
+</section>
+
+<section id="sec-scroll">
+  <h2>滚动容器与懒加载</h2>
+  <div id="inner-scroll"></div>
+  <div id="lazy-zone"><div class="lazy-item">lazy-sentinel(滚到我下面触发加载)</div></div>
+  <div style="height: 1200px">页面级长内容(撑出页面滚动)</div>
+</section>
+
+<section id="sec-iframe">
+  <h2>iframe</h2>
+  <iframe id="frame-child" src="child.html" width="400" height="120"></iframe>
+</section>
+
+<section id="sec-dialog">
+  <h2>对话框</h2>
+  <button id="btn-alert" onclick="alert('BU-ALERT')">弹 alert</button>
+  <button id="btn-confirm" onclick="log('confirm-result=' + confirm('BU-CONFIRM?'))">弹 confirm</button>
+</section>
+
+<section id="sec-log">
+  <h2>日志区(断言目标)</h2>
+  <div id="log">(空)</div>
+</section>
+
+<script>
+function log(msg) {
+  const el = document.getElementById('log');
+  el.textContent += (el.textContent === '(空)' ? '' : ' | ') + msg;
+}
+
+// shadow root(open)
+(() => {
+  const host = document.getElementById('shadow-open-host');
+  const sr = host.attachShadow({ mode: 'open' });
+  sr.innerHTML = '<button id="shadow-open-btn">open-shadow按钮</button>';
+  sr.querySelector('button').addEventListener('click', () => log('open-shadow-clicked'));
+})();
+// shadow root(closed)
+(() => {
+  const host = document.getElementById('shadow-closed-host');
+  const sr = host.attachShadow({ mode: 'closed' });
+  sr.innerHTML = '<button id="shadow-closed-btn">closed-shadow按钮</button>';
+  sr.querySelector('button').addEventListener('click', () => log('closed-shadow-clicked'));
+})();
+
+function submitForm() {
+  const name = document.getElementById('f-name').value;
+  const city = document.getElementById('f-city').value;
+  const agree = document.getElementById('f-agree').checked;
+  const bio = document.getElementById('f-bio').value;
+  document.getElementById('form-result').textContent =
+    `submitted name=${name} city=${city} agree=${agree} bioLen=${bio.length}`;
+}
+
+function rebuildList() {
+  const ul = document.getElementById('dyn-list');
+  ul.innerHTML = '';
+  for (let i = 0; i < 5; i++) {
+    const li = document.createElement('li');
+    li.textContent = 'rebuilt-' + i + '-' + Date.now();
+    ul.appendChild(li);
+  }
+  log('list-rebuilt');
+}
+
+// 内层滚动容器 30 行
+(() => {
+  const box = document.getElementById('inner-scroll');
+  for (let i = 1; i <= 30; i++) {
+    const d = document.createElement('div');
+    d.className = 'row';
+    d.textContent = 'inner-row-' + i;
+    box.appendChild(d);
+  }
+})();
+
+// 懒加载:哨兵进入视口 → 追加 20 项(分 3 批,模拟无限滚动)
+(() => {
+  let batch = 0;
+  const zone = document.getElementById('lazy-zone');
+  const io = new IntersectionObserver((entries) => {
+    if (entries.some(e => e.isIntersecting) && batch < 3) {
+      batch++;
+      for (let i = 0; i < 20; i++) {
+        const d = document.createElement('div');
+        d.className = 'lazy-item';
+        d.textContent = `lazy-item-b${batch}-${i}`;
+        zone.appendChild(d);
+      }
+    }
+  }, { root: null });
+  const sentinel = document.querySelector('.lazy-item');
+  io.observe(sentinel);
+})();
+
+// 文件选择回显
+document.getElementById('f-file').addEventListener('change', (e) => {
+  const fs = e.target.files;
+  log('file-selected=' + (fs.length ? fs[0].name : 'none') + ' count=' + fs.length);
+});
+</script>
+</body>
+</html>

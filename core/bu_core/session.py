@@ -54,6 +54,11 @@ class BrowserSession:
             self.console_started = True
         except Exception:
             pass
+        # JS 弹窗自动处理(阻塞 CDP 的头号来源);文本记录进后续版本
+        try:
+            self.tab.set.auto_handle_alert(True)
+        except Exception:
+            pass
         bv = ""
         try:
             bv = self.tab.run_cdp("Browser.getVersion").get("product", "")

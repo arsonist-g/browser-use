@@ -22,14 +22,21 @@ def _live_url(sess):
         return sess.t.url
 
 
-def _uid_quad(sess, uid):
-    """uid → backendDOMNodeId → 屏幕四角(中心点即拟人点击落点)。"""
+def _run_js_with_value(t, template, value):
+    """run_js 的 args 传参在 DP 中不可靠(函数参数为空)——一律 JSON 内插。"""
+    literal = json.dumps(value, ensure_ascii=False)
+    return t.run_js(template.format(v=literal))
+
+
+def _uid_point(sess, uid):
+    """uid → 滚动至可见 → 视口中心坐标。视口外元素先 scrollIntoViewIfNeeded(CDP 域)。"""
     node = sess.uid_map.get(uid)
     if not node:
         raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
     bnn = node.get("backendDOMNodeId")
     if not bnn:
         raise KeyError(f"uid {uid} 无对应 DOM 节点")
+    sess.t.run_cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=bnn)
     res = sess.t.run_cdp("DOM.getContentQuads", backendNodeId=bnn)
     quads = res.get("quads") or []
     if not quads:
@@ -37,6 +44,20 @@ def _uid_quad(sess, uid):
     q = quads[0]  # [x1,y1,x2,y2,...] 4 角
     xs, ys = q[0::2], q[1::2]
     return (sum(xs) / len(xs), sum(ys) / len(ys), min(xs), min(ys), max(xs), max(ys))
+
+
+def _uid_quad(sess, uid):
+    """兼容入口:取中心坐标(带滚动至可见 + 命中校验)。"""
+    cx, cy, *_ = _uid_point(sess, uid)
+    try:
+        hit = sess.t.run_js(
+            f"return (function(){{ const e = document.elementFromPoint({cx}, {cy});"
+            f" return e ? e.tagName : 'null'; }})()")
+    except Exception:
+        hit = "unknown"
+    if hit == "null":
+        raise KeyError(f"uid {uid} 滚动后仍不可点(坐标 {cx:.0f},{cy:.0f} 处无元素命中)")
+    return (cx, cy)
 
 
 def _with_snapshot(sess, include, extra=None):
@@ -67,23 +88,37 @@ def scroll(sess, args, session_dir):
     amount = int(args.get("amount") or 600)
     uid = args.get("uid")
     if uid:
-        cx, cy, *_ = _uid_quad(sess, uid)
+        cx, cy = _uid_quad(sess, uid)
+        humanize.move_mouse(t, cx, cy)
+    else:
+        # 滚轮落点必须在内:取视口中心(写死坐标会超出小视口)
+        vp = t.run_js("return [innerWidth, innerHeight]")
+        cx, cy = int(vp[0] / 2), int(vp[1] / 2)
         humanize.move_mouse(t, cx, cy)
     dx = amount if direction == "right" else -amount if direction == "left" else 0
     dy = amount if direction == "down" else -amount if direction == "up" else 0
-    t.run_cdp("Input.dispatchMouseEvent", type="mouseWheel", x=960, y=540,
+    before = t.run_js("return scrollY") or 0
+    t.run_cdp("Input.dispatchMouseEvent", type="mouseWheel", x=cx, y=cy,
               deltaX=dx, deltaY=dy)
+    time.sleep(0.3)
+    after = t.run_js("return scrollY") or 0
+    if after == before and dy:
+        # 滚轮未生效(无命中/合成限制)→ JS 兜底
+        t.run_js(f"window.scrollBy(0, {dy})")
+        time.sleep(0.2)
+        after = t.run_js("return scrollY") or 0
     humanize.op_delay()
-    return _with_snapshot(sess, args.get("includeSnapshot"), {"scrolled": True})
+    return _with_snapshot(sess, args.get("includeSnapshot"),
+                          {"scrolled": True, "scrollY": after, "wheel_used": after != before})
 
 
 # ---- 输入类(拟人) ----
 
 def click(sess, args, session_dir):
-    cx, cy, *_ = _uid_quad(sess, str(args["uid"]))
+    cx, cy = _uid_quad(sess, str(args["uid"]))
     humanize.click_xy(sess.t, cx, cy, dbl=bool(args.get("dblClick")))
     humanize.op_delay()
-    return _with_snapshot(sess, args.get("includeSnapshot"), {"clicked": True})
+    return _with_snapshot(sess, args.get("includeSnapshot"), {"clicked": True, "x": round(cx, 1), "y": round(cy, 1)})
 
 
 def hover(sess, args, session_dir):
@@ -109,30 +144,40 @@ def fill(sess, args, session_dir):
     t = sess.t
     uid = str(args["uid"])
     value = str(args["value"])
-    cx, cy, *_ = _uid_quad(sess, uid)
-    humanize.click_xy(t, cx, cy)  # 聚焦
-    # 主世界单次 evaluate(非 Runtime.enable):按元素类型置值
-    kind = t.run_js(
-        """(v) => {
+    node = sess.uid_map.get(uid)
+    if not node:
+        raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
+    bnn = node.get("backendDOMNodeId")
+    # 可见 → 强聚焦(不依赖点击命中)→ 拟人点击(真实感)→ 按类型置值
+    t.run_cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=bnn)
+    t.run_cdp("DOM.focus", backendNodeId=bnn)
+    try:
+        cx, cy = _uid_quad(sess, uid)
+        humanize.click_xy(t, cx, cy)
+    except Exception:
+        pass  # 聚焦已由 DOM.focus 保证;点击仅为拟人(几何异常不阻断)
+    # 主世界单次 evaluate(非 Runtime.enable):按元素类型置值(v 经 JSON 内插)
+    kind = _run_js_with_value(t, """return (function(v) {{
              const el = document.activeElement;
              if (!el) return 'no-focus';
-             if (el.tagName === 'SELECT') {
+             if (el.tagName === 'SELECT') {{
                let opt = [...el.options].find(o => o.value === v || o.text === v);
                if (opt) el.value = opt.value;
-               el.dispatchEvent(new Event('change', {bubbles: true}));
+               el.dispatchEvent(new Event('change', {{bubbles: true}}));
                return 'select';
-             }
-             if (el.type === 'checkbox' || el.type === 'radio') {
+             }}
+             if (el.type === 'checkbox' || el.type === 'radio') {{
                el.checked = (v === 'true');
-               el.dispatchEvent(new Event('change', {bubbles: true}));
+               el.dispatchEvent(new Event('change', {{bubbles: true}}));
                return 'checked';
-             }
+             }}
+             el.value = v;
+             el.dispatchEvent(new Event('input', {{bubbles: true}}));
+             el.dispatchEvent(new Event('change', {{bubbles: true}}));
              return 'text';
-           }""", value)
-    if kind == "text":
-        t.run_cdp("Input.insertText", text=value)
+           }})({v})""", value)
     humanize.op_delay()
-    return _with_snapshot(sess, args.get("includeSnapshot"), {"filled": True})
+    return _with_snapshot(sess, args.get("includeSnapshot"), {"filled": True, "kind": kind})
 
 
 def fill_form(sess, args, session_dir):
@@ -245,9 +290,19 @@ def take_screenshot(sess, args, session_dir):
 
 
 def evaluate_script(sess, args, session_dir):
-    fn = str(args["function"])
-    # 兼容 "() => expr" 箭头形式:直接交 DP run_js
-    val = sess.t.run_js(fn)
+    fn = str(args["function"]).strip()
+    # 兼容三种写法:"() => expr" / "() => { statements }" / "return expr" / 裸表达式
+    if fn.startswith("() =>"):
+        body = fn[5:].strip()
+        if body.startswith("{"):
+            script = "return (function() " + body + ")()"
+        else:
+            script = "return (" + body + ")"
+    elif "return" in fn:
+        script = fn
+    else:
+        script = "return (" + fn + ")"
+    val = sess.t.run_js(script)
     return {"value": _jsonable(val)}
 
 
