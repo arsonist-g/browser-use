@@ -18,10 +18,15 @@ const TOOL_POS = {
   select_page: ["page_id"], close_page: ["page_id"], wait_for: ["text"],
   evaluate_script: ["function"], get_network_request: ["reqid"], get_console_message: ["msgid"],
   take_screenshot: [], take_snapshot: [], scroll: [], click_at: ["x", "y"],
-  resize_page: ["width", "height"], execute_3p_developer_tool: ["tool"],
+  resize_page: ["width", "height"], execute_3p_developer_tool: ["toolName"],
   get_heapsnapshot_details: ["name"],
   get_heapsnapshot_edges: ["node_index"], get_heapsnapshot_retainers: ["node_index"],
   get_heapsnapshot_retaining_paths: ["node_index"], get_heapsnapshot_object_details: ["node_index"],
+  install_extension: ["path"], uninstall_extension: ["id"], reload_extension: ["id"],
+  trigger_extension_action: ["id"],
+  get_os_app_state: ["manifestId"], install_pwa: ["manifestId", "installUrlOrBundleUrl"],
+  launch_pwa: ["manifestId"], uninstall_pwa: ["manifestId"],
+  execute_webmcp_tool: ["toolName"],
 };
 const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
   "headless", "bringToFront", "fix"]);
@@ -29,7 +34,10 @@ const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullP
 // ---- utils ----
 function out(text) { process.stdout.write(text + "\n"); }
 function outJson(obj) { out(JSON.stringify(obj, null, 2)); }
-function die(code, msg) { process.stderr.write(`error: ${msg}\n`); process.exit(code); }
+// stderr 用 fs.writeSync 同步写:process.stderr 对 pipe 是异步的,直接 process.exit()
+// 会在 flush 前终止进程,Windows 上错误输出随机丢失——AI 消费面拿不到错误原因
+function errOut(text) { try { fs.writeSync(2, text); } catch { /* 关闭中 */ } }
+function die(code, msg) { errOut(`error: ${msg}\n`); process.exit(code); }
 
 function rpc(op, payload, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
@@ -140,7 +148,12 @@ usage:
     switch (command) {
       case "start": {
         await ensureDaemon();
-        const r = await rpc("session.start", { headless: values.headless, browser_exe: values["browser-exe"] });
+        let extraFlags;
+        if (values["extra-flags"]) {
+          try { extraFlags = JSON.parse(values["extra-flags"]); }
+          catch { extraFlags = values["extra-flags"].split(/\s+/).filter(Boolean); }
+        }
+        const r = await rpc("session.start", { headless: values.headless, browser_exe: values["browser-exe"], extra_flags: extraFlags });
         if (jsonMode) return outJson(r);
         out(`session=${r.session_id}`);
         if (r.login_state === "injected") out("login=injected(登录态已注入)");
@@ -204,9 +217,13 @@ usage:
         pos.forEach((k, i) => { if (positionals[i] !== undefined) args[k] = positionals[i]; });
         for (const [k, v] of Object.entries(values)) {
           if (v === undefined || k === "output-format" || k === "session" || k === "timeout" || k === "fix") continue;
-          args[k.replace(/-/g, "_")] = v;   // kebab → snake(--snapshot-id → snapshot_id)
+          let typed = v;   // 布尔字面量转真布尔(--reload false 否则会成字符串 "false")
+          if (v === "true") typed = true;
+          else if (v === "false") typed = false;
+          args[k.replace(/-/g, "_")] = typed;   // kebab → snake(--snapshot-id → snapshot_id)
         }
-        const r = await rpc("tool.call", { session_id: sid, tool: command, args });
+        const r = await rpc("tool.call", { session_id: sid, tool: command, args,
+          timeout_ms: values.timeout ? Number(values.timeout) : undefined });
         if (jsonMode) return outJson(r);
         return out(fmtResult(command, r));
       }
@@ -215,9 +232,9 @@ usage:
     if (jsonMode) {
       outJson({ error: { code: e.code ?? "INTERNAL", message: e.message, retryable: !!e.retryable } });
     } else {
-      process.stderr.write(`error[${e.code ?? "INTERNAL"}]: ${e.message}\n`);
+      errOut(`error[${e.code ?? "INTERNAL"}]: ${e.message}\n`);
       if (e.code === "BRIDGE_NOT_CONNECTED" || e.code === "BRIDGE_TIMEOUT") {
-        process.stderr.write("提示: 请确认日常浏览器已打开、Bridge 扩展 popup 显示已连接;或 browser-use session.bare --session=<id> 跳过登录态。\n");
+        errOut("提示: 请确认日常浏览器已打开、Bridge 扩展 popup 显示已连接;或 browser-use session.bare --session=<id> 跳过登录态。\n");
       }
     }
     process.exit(e.code === "BRIDGE_NOT_CONNECTED" || e.code === "BRIDGE_TIMEOUT" ? 4 : 5);

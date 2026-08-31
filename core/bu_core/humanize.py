@@ -71,13 +71,79 @@ def type_text(tab, text, submit_key=None):
 
 _KEY_MODIFIERS = {"Control", "Alt", "Shift", "Meta"}
 
+# Windows VK(US 布局);覆盖 cdt/puppeteer KeyInput 常用全集
+_NAMED_VK = {
+    "Enter": 13, "NumpadEnter": 13, "\r": 13, "\n": 13,
+    "Tab": 9, "Escape": 27, "Backspace": 8, "Delete": 46,
+    "ArrowUp": 38, "ArrowDown": 40, "ArrowLeft": 37, "ArrowRight": 39,
+    "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34, "Space": 32, " ": 32,
+    "Insert": 45, "Pause": 19, "CapsLock": 20, "NumLock": 144, "ScrollLock": 145,
+    "ContextMenu": 93,
+    "ShiftLeft": 160, "ShiftRight": 161, "ControlLeft": 162, "ControlRight": 163,
+    "AltLeft": 164, "AltRight": 165, "MetaLeft": 91, "MetaRight": 92,
+    "Numpad0": 96, "Numpad1": 97, "Numpad2": 98, "Numpad3": 99, "Numpad4": 100,
+    "Numpad5": 101, "Numpad6": 102, "Numpad7": 103, "Numpad8": 104, "Numpad9": 105,
+    "NumpadMultiply": 106, "NumpadAdd": 107, "NumpadSubtract": 109,
+    "NumpadDecimal": 110, "NumpadDivide": 111,
+    "AudioVolumeMute": 173, "AudioVolumeDown": 174, "AudioVolumeUp": 175,
+    "MediaTrackNext": 176, "MediaTrackPrevious": 177, "MediaStop": 178,
+    "MediaPlayPause": 179,
+    "Semicolon": 186, "Equal": 187, "Comma": 188, "Minus": 189, "Period": 190,
+    "Slash": 191, "Backquote": 192, "BracketLeft": 219, "Backslash": 220,
+    "BracketRight": 221, "Quote": 222,
+    "=": 187, "+": 187, "-": 189, ";": 186, ",": 188, ".": 190, "/": 191,
+    "`": 192, "[": 219, "\\": 220, "]": 221, "'": 222,
+}
+
+
+def _vk(key):
+    named = _NAMED_VK.get(key)
+    if named is not None:
+        return named
+    if key.startswith("F") and key[1:].isdigit():
+        n = int(key[1:])
+        if 1 <= n <= 24:
+            return 111 + n  # VK_F1=112 ... VK_F24=135
+    if len(key) == 1 and key.isalpha():
+        return ord(key.upper())
+    if key.startswith("Key") and len(key) == 4 and key[3].isalpha():
+        return ord(key[3].upper())
+    if key.startswith("Digit") and len(key) == 6 and key[5].isdigit():
+        return ord(key[5])
+    if key.isdigit():
+        return ord(key)
+    return 0
+
+
+def parse_key(key_input):
+    """对齐 cdt parseKey:逐字符扫描,"+" 在缓冲非空时为分隔(支持 "Control++");
+    返回 [主键, ...修饰键(原序)];重复键报错。"""
+    result = []
+    buf = ""
+    for ch in str(key_input):
+        if ch == "+" and buf:
+            result.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if buf:
+        result.append(buf)
+    if not result:
+        raise ValueError(f"Key {key_input} could not be parsed.")
+    if len(set(result)) != len(result):
+        raise ValueError(f"Key {key_input} contains duplicate keys.")
+    invalid = [k for k in result if _vk(k) == 0]
+    if invalid:
+        raise ValueError(f"Key {key_input} is invalid: {invalid[0]}")
+    # cdt 形状:[主键, ...修饰键](主键在末位 → 返回时反转)
+    return [result[-1], *result[:-1]]
+
 
 def press_key(tab, key):
-    """Enter/Control+A 形式;修饰键按住→主键→释放。"""
+    """Enter/Control+A 形式;修饰键按住→主键→释放。可打印字符走 keyDown(text)
+    使其产生实际输入(对齐 puppeteer press 语义,rawKeyDown 不生成字符)。"""
     import time
-    parts = key.split("+")
-    mods = [p for p in parts if p in _KEY_MODIFIERS]
-    main = parts[-1]
+    main, *mods = parse_key(key)
     modifiers = 0
     for m in mods:
         modifiers |= {"Control": 2, "Alt": 1, "Shift": 8, "Meta": 4}[m]
@@ -85,12 +151,17 @@ def press_key(tab, key):
                     key=m, code=f"{m}Left", modifiers=modifiers, windowsVirtualKeyCode=_vk(m))
     time.sleep(_gauss(0.03, 0.09))
     code = _vk(main)
-    tab.run_cdp("Input.dispatchKeyEvent", type="rawKeyDown", key=main,
-                code=f"Key{main}" if len(main) == 1 and main.isalpha() else main,
-                windowsVirtualKeyCode=code, modifiers=modifiers)
+    code_field = f"Key{main}" if len(main) == 1 and main.isalpha() else main
+    printable = len(main) == 1 and not mods and main.isprintable()
+    main_type = "keyDown" if printable else "rawKeyDown"
+    down_kwargs = dict(type=main_type, key=main, code=code_field,
+                       windowsVirtualKeyCode=code, modifiers=modifiers)
+    if printable:
+        down_kwargs["text"] = main
+        down_kwargs["unmodifiedText"] = main
+    tab.run_cdp("Input.dispatchKeyEvent", **down_kwargs)
     tab.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=main,
-                code=f"Key{main}" if len(main) == 1 and main.isalpha() else main,
-                windowsVirtualKeyCode=code, modifiers=modifiers)
+                code=code_field, windowsVirtualKeyCode=code, modifiers=modifiers)
     for m in reversed(mods):
         modifiers -= {"Control": 2, "Alt": 1, "Shift": 8, "Meta": 4}[m]
         tab.run_cdp("Input.dispatchKeyEvent", type="keyUp",

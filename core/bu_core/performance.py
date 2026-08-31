@@ -1,56 +1,128 @@
 # -*- coding: utf-8 -*-
-"""Performance 三件套:start_trace(Tracing 域采集)/ stop_trace(落盘 JSON)/
-analyze_insight(自建最小指标集:LCP/长任务/布局抖动聚合;全量 19 个 DevTools
-insight 的对齐为已知风险项,收敛策略见 architecture.md Delta)。
+"""Performance 三件套(对齐 cdt v1.8.0 行为契约):
+
+- start_trace:reload(默认 true,先 about:blank 清态再回原 URL)+ autoStop(默认 true,
+  固定 5s 后自动停止);单例(已在录制则报错);类别 = DevTools 默认集(cdt 同源)。
+- stop_trace:未在录制时为 no-op(cdt 同);filePath 支持 .json/.gz。
+- analyze_insight:自建最小指标集(DevTools TraceEngine 19 项全对齐为备案的已知风险项,
+  收敛策略见 architecture.md Delta)——参数保持 insightSetId/insightName 形状上的兼容入口,
+  另支持 filePath 直接分析已落盘 trace(私有扩展,报告注明)。
 """
+import gzip
 import json
 import os
 import time
 
 from .cdp_events import CdpEvents
 
+# DevTools Tracing 默认类别(cdt: '-*' + TracingDefaultCategories + JsSampling + Screenshot)
+_TRACE_CATEGORIES = [
+    "-*",
+    "blink.console", "blink.user_timing", "devtools.timeline", "loading",
+    "disabled-by-default-devtools.screenshot",
+    "disabled-by-default-devtools.timeline.frame",
+    "disabled-by-default-devtools.timeline.stack",
+    "disabled-by-default-v8.cpu_profiler", "disabled-by-default-v8.cpu_profiler.hires",
+    "latencyInfo", "v8.execute", "v8",
+    "disabled-by-default-lighthouse",
+]
 
-def start_trace(sess, args, session_dir):
-    if getattr(sess, "_cdp", None) is None:
-        sess._cdp = CdpEvents(sess.port).connect()
-    sess._cdp.send("Tracing.start", traceConfig={
-        "traceConfig": {"recordMode": "recordUntilFull",
-                        "includedCategories": ["devtools.timeline", "v8.execute",
-                                               "disabled-by-default-devtools.timeline.frame",
-                                               "loading", "paint", "netlog"]}})
+
+def _ensure_cdp(sess):
+    from .cdp_events import ensure_session_cdp
+    return ensure_session_cdp(sess)
+
+
+def _start_tracing(cdp):
+    """Tracing.start 用 call(等响应):闲置后的半开连接 send 不报错但命令石沉大海,
+    等不到响应即重连重发。"""
+    try:
+        cdp.call("Tracing.start", timeout=5,
+                 traceConfig={"recordMode": "recordUntilFull",
+                              "includedCategories": _TRACE_CATEGORIES})
+    except Exception:
+        cdp.reconnect()
+        cdp.call("Tracing.start", timeout=5,
+                 traceConfig={"recordMode": "recordUntilFull",
+                              "includedCategories": _TRACE_CATEGORIES})
+
+
+def performance_start_trace(sess, args, session_dir):
+    from .tools import _live_url  # 局部导入:tools.py 底部反向挂载本模块,顶层导入会循环
+    if getattr(sess, "_tracing_on", False):
+        raise RuntimeError("a performance trace is already running. Use performance_stop_trace "
+                           "to stop it. Only one trace can be running at any given time.")
     sess._tracing_on = True
-    return {"started": True, "note": "autoStop 默认在下次导航/显式 stop 前持续采集"}
+    cdp = _ensure_cdp(sess)
+    t = sess.t
+    reload = bool(args.get("reload", True))
+    try:
+        url_for_tracing = _live_url(sess)
+        if reload:
+            t.get("about:blank")  # 清态(cdt 同;waitUntil load)
+        _start_tracing(cdp)
+        if reload:
+            t.get(url_for_tracing)
+            try:
+                t.wait.doc_loaded(20)
+            except Exception:
+                pass
+        if args.get("autoStop", True):
+            time.sleep(5)
+            return performance_stop_trace(sess, {"filePath": args.get("filePath")}, session_dir)
+        return {"started": True, "note": "recording; use performance_stop_trace to stop"}
+    except Exception:
+        # 出错时复位(cdt 同:避免录制标志卡死)
+        try:
+            cdp.send("Tracing.end")
+        except Exception:
+            pass
+        sess._tracing_on = False
+        raise
 
 
-def stop_trace(sess, args, session_dir):
+def performance_stop_trace(sess, args, session_dir):
     if getattr(sess, "_cdp", None) is None or not getattr(sess, "_tracing_on", False):
-        raise RuntimeError("trace 未开启(先 performance_start_trace)")
+        return {"stopped": False}  # cdt:未在录制时静默 no-op
+    cdp = sess._cdp
     events = []
-    sess._cdp.send("Tracing.end")
+    try:
+        cdp.call("Tracing.end", timeout=5)  # call 暴露半开连接,失败重连重发
+    except Exception:
+        try:
+            cdp.reconnect()
+            cdp.call("Tracing.end", timeout=5)
+        except Exception:
+            pass
     deadline = time.time() + 30
     done = False
     while time.time() < deadline and not done:
-        sess._cdp.pump()
-        for m, p in sess._cdp.drain_events("Tracing."):
+        cdp.pump()
+        for m, p in cdp.drain_events("Tracing."):
             if m == "Tracing.dataCollected":
                 events.extend(p.get("value", []))
             elif m == "Tracing.tracingComplete":
                 done = True
     fp = args.get("filePath") or sess.artifact_path(session_dir, "trace", "json")
-    with open(fp, "w", encoding="utf-8") as f:
-        json.dump({"traceEvents": events}, f, ensure_ascii=False)
+    if str(fp).endswith(".gz"):
+        with gzip.open(fp, "wb") as f:
+            f.write(json.dumps({"traceEvents": events}, ensure_ascii=False).encode("utf-8"))
+    else:
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump({"traceEvents": events}, f, ensure_ascii=False)
     sess._tracing_on = False
     try:
-        sess._cdp.close()
+        cdp.close()
         sess._cdp = None
     except Exception:
         pass
-    return {"path": fp, "events": len(events)}
+    return {"stopped": True, "path": fp, "events": len(events)}
 
 
-def analyze_insight(sess, args, session_dir):
+def performance_analyze_insight(sess, args, session_dir):
     """自建最小指标集(真值来自已落盘 trace):长任务(>50ms)、布局抖动计数、
-    LCP 候选(largest Image/Paint 事件)、网络请求数。"""
+    LCP 候选、网络请求数。insightSetId/insightName 为 cdt 参数形状的兼容入口
+    (接受但影响返回的自选 insight 子集);filePath 为本实现的 trace 来源。"""
     fp = args.get("filePath")
     if not fp or not os.path.exists(fp):
         raise ValueError("需要 performance_stop_trace 产出的 filePath")
@@ -75,17 +147,21 @@ def analyze_insight(sess, args, session_dir):
     if lcp_best and ev:
         t0 = min(e.get("ts", 0) for e in ev)
         lcp_ms = round((lcp_best - t0) / 1000.0, 1)
-    return {
+    insights = {
         "long_tasks_over_50ms": len(long_tasks),
         "long_tasks_ms_top10": sorted(long_tasks, reverse=True)[:10],
         "layout_shifts": len(layout_shifts),
         "lcp_ms_candidate": lcp_ms,
         "network_requests": net_requests,
-        "note": "自建最小指标集;DevTools 19 项 insight 全对齐为后续迭代(风险项已备案)",
     }
-
-
-# 工具注册名对齐 chrome-devtools-mcp
-performance_start_trace = start_trace
-performance_stop_trace = stop_trace
-performance_analyze_insight = analyze_insight
+    insight_name = args.get("insightName")
+    if insight_name:
+        # cdt 形状:按 insightName 取子项;自建指标集与 DevTools 19 项不同名,给映射提示
+        return {"insightSetId": args.get("insightSetId", "NAVIGATION_0"),
+                "insightName": insight_name,
+                "available_insights": sorted(insights.keys()),
+                "data": insights.get(insight_name.lower().replace("breakdown", "").replace("culprits", ""),
+                                     None) or insights,
+                "note": "自建最小指标集;DevTools 19 项 insight 全对齐为后续迭代(风险项已备案)"}
+    return {**insights,
+            "note": "自建最小指标集;DevTools 19 项 insight 全对齐为后续迭代(风险项已备案)"}

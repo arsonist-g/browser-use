@@ -5,14 +5,59 @@
 import os
 from DrissionPage import Chromium, ChromiumOptions
 
+# console.* 捕获 hook:Console 域在新版 Edge/Chrome 不再派发事件(实测 enable 成功但 0 事件),
+# 而 Runtime.enable 属红线(CONSTRAINT-001)。改为 addScriptToEvaluateOnNewDocument 注入透传
+# hook(仅包 console 五法,原方法照常执行,缓冲留在页内,每文档一个随机 epoch 供去重)。
+_CONSOLE_HOOK_JS = """(() => {
+  if (window.__buConsole) return;
+  const buf = [];
+  const epoch = Math.random().toString(36).slice(2, 10);
+  const rec = (ty, orig) => function (...args) {
+    try {
+      if (buf.length < 500) {
+        const text = args.map(a => {
+          if (typeof a === 'string') return a;
+          try { return JSON.stringify(a); } catch (e) { return String(a); }
+        }).join(' ');
+        // 调用点栈(includeStackTraces 用):栈首行为 Error 标题、次行为 rec 自身,砍掉
+        const stack = String(new Error().stack || '').split('\\n').slice(2).join('\\n').slice(0, 2000);
+        buf.push({ epoch, seq: buf.length, type: ty, text: text.slice(0, 2000), stack });
+      }
+    } catch (e) {}
+    return orig.apply(console, args);
+  };
+  for (const ty of ['log', 'info', 'warn', 'error', 'debug']) {
+    const orig = console[ty];
+    if (typeof orig === 'function') console[ty] = rec(ty, orig);
+  }
+  try {
+    Object.defineProperty(window, '__buConsole', { get: () => buf });
+    Object.defineProperty(window, '__buConsoleEpoch', { get: () => epoch });
+  } catch (e) {}
+})();"""
+
+
+def install_console_hook(tab):
+    """对新 tab 注入 console hook(每个 Page target 独立,需逐 tab 装)。"""
+    try:
+        tab.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=_CONSOLE_HOOK_JS)
+    except Exception:
+        pass
+
 
 class BrowserSession:
-    def __init__(self, session_id, port, profile, browser_exe=None, headless=False):
+    def __init__(self, session_id, port, profile, browser_exe=None, headless=False,
+                 attach=False, extra_flags=None):
         self.session_id = session_id
         self.port = port
         self.profile = profile
         self.browser_exe = browser_exe
         self.headless = headless
+        # attach:浏览器已由 daemon 以 pipe+port 双通道启动,DP 只接管(不启动)
+        self.attach = attach
+        self.extra_flags = extra_flags or []
+        # WebMCP 需要 flag(运行时特征变更,默认不开 = CONSTRAINT-001 权衡)
+        self.webmcp_enabled = "--enable-features=WebMCP" in self.extra_flags
         self.browser = None
         self.tab = None
         # 页内工具共用状态
@@ -27,18 +72,24 @@ class BrowserSession:
             co.set_browser_path(self.browser_exe)
         co.set_local_port(self.port)
         co.set_user_data_path(self.profile)
-        # 扩展白名单(默认空 = 全禁;白名单机制 Should,实现后此处按白名单传 --disable-extensions-except)
-        whitelist = self._whitelist_paths()
-        if whitelist:
-            co.set_argument("--disable-extensions-except", "|".join(whitelist))
+        if self.attach:
+            # 接管 daemon 启动的实例:启动参数不生效,但 headless 选项必须与实际一致,
+            # 否则 DP 判定不匹配会杀掉现有实例重启(丢失 pipe 通道)
+            if self.headless:
+                co.headless()
         else:
-            co.set_argument("--disable-extensions")
-        # Edge 首启/同步/更新提示类弹窗与页面全面禁用(不影响指纹语义)
-        co.set_argument("--disable-features",
-                        "msFirstRunExperience,msSeamlessWebToBrowserSignIn,msImplicitSignin,"
-                        "EdgeWelcomePage,EdgeUpdateToast,msEdgeUpdateToast")
-        if self.headless:
-            co.headless()
+            # 扩展白名单(默认空 = 全禁;白名单机制 Should,实现后此处按白名单传 --disable-extensions-except)
+            whitelist = self._whitelist_paths()
+            if whitelist:
+                co.set_argument("--disable-extensions-except", "|".join(whitelist))
+            else:
+                co.set_argument("--disable-extensions")
+            # Edge 首启/同步/更新提示类弹窗与页面全面禁用(不影响指纹语义)
+            co.set_argument("--disable-features",
+                            "msFirstRunExperience,msSeamlessWebToBrowserSignIn,msImplicitSignin,"
+                            "EdgeWelcomePage,EdgeUpdateToast,msEdgeUpdateToast")
+            if self.headless:
+                co.headless()
         self.browser = Chromium(co)
         self.tab = self.browser.latest_tab
         self.prune_edge_popups()
@@ -54,11 +105,10 @@ class BrowserSession:
             self.console_started = True
         except Exception:
             pass
-        # JS 弹窗自动处理(阻塞 CDP 的头号来源);文本记录进后续版本
-        try:
-            self.tab.set.auto_handle_alert(True)
-        except Exception:
-            pass
+        # 弹窗不自动处理(对齐 cdt:dialog 挂起阻塞页面 JS,由 handle_dialog 工具
+        # 显式 accept/dismiss;自动 accept 会让 handle_dialog 永远无弹窗可处理)
+        # console 捕获 hook(每 Page target 注入一次,导航后自动重挂)
+        install_console_hook(self.tab)
         bv = ""
         try:
             bv = self.tab.run_cdp("Browser.getVersion").get("product", "")
@@ -72,12 +122,16 @@ class BrowserSession:
 
     @property
     def t(self):
-        # 固定主任务 tab:Edge 会中途弹 sync 确认页抢占 latest_tab,不能跟随
+        # 固定主任务 tab:Edge 会中途弹 sync 确认页抢占 latest_tab,不能跟随。
+        # 注意:DP 的 get_tabs() 每次返回全新 tab 对象(无 __eq__,身份比较永不匹配),
+        # 若据此换对象,tab 级状态(listen 监听等)会每次访问都丢——必须按 tab_id 比对复用。
         tabs = self.browser.get_tabs()
         if not tabs:
             return self.tab
-        if self.tab not in tabs:
-            self.tab = tabs[0]
+        cur_id = getattr(self.tab, "tab_id", None)
+        if cur_id is not None and any(tb.tab_id == cur_id for tb in tabs):
+            return self.tab
+        self.tab = tabs[0]
         return self.tab
 
     def _whitelist_paths(self):

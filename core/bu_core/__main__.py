@@ -25,10 +25,15 @@ def main():
     ap.add_argument("--session-dir", required=True)
     ap.add_argument("--browser-exe", default=None)
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--attach", action="store_true",
+                    help="接管 daemon 已启动的浏览器实例(pipe+port 双通道),不自行启动")
+    ap.add_argument("--extra-flag", action="append", default=[],
+                    help="会话级附加启动 flag(如 --enable-features=WebMCP;仅记录,供工具门控)")
     args = ap.parse_args()
 
     sess = BrowserSession(args.session_id, args.port, args.profile,
-                          browser_exe=args.browser_exe, headless=args.headless)
+                          browser_exe=args.browser_exe, headless=args.headless,
+                          attach=args.attach, extra_flags=args.extra_flag)
 
     def log_tool(tool, args_redacted, ok, err=None, dur=0):
         try:

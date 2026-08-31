@@ -1,0 +1,8 @@
+{
+  "name": "BU Fixture PWA",
+  "short_name": "BU PWA",
+  "id": "/",
+  "start_url": "/pwa.html",
+  "display": "standalone",
+  "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+}

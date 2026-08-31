@@ -147,25 +147,40 @@ async function main() {
   }
   ok("懒加载第一批被触发(lazy-item-b1)", snap.includes("lazy-item-b1"), "滚动后快照未见懒加载内容");
 
-  // ---- 8. dialog(click 报"未处理提示框"属预期,accept 收尾即可) ----
+  // ---- 8. dialog:工具撞上未处理弹窗报错属 blockedByDialog 预期语义(cdt 同);
+  //         handle_dialog accept 后流程恢复 ----
   console.log("\n[8] 对话框");
   const alertUid = parseSnapUid(snap, "弹 alert");
   let dialogErr = null;
   try {
     bu(["click", "--session", sessionId, alertUid]);
-  } catch (e) { dialogErr = e.message; }
+  } catch (e) { if (!/未处理|dialog/i.test(e.message)) dialogErr = e.message; }
   try {
     bu(["handle_dialog", "--session", sessionId, "accept"]);
   } catch (e) { dialogErr = (dialogErr ?? "") + " / accept: " + e.message; }
-  ok("alert+accept 流程收尾", !dialogErr, dialogErr ?? "");
+  // accept 后 evaluate 可执行 = 页面 JS 已从弹窗阻塞中恢复
+  let recovered = false;
+  try {
+    const ev = bu(["evaluate_script", "--session", sessionId, "() => 1+1", "--output-format=json"]);
+    recovered = ev.includes("2");
+  } catch { /* 未恢复 */ }
+  ok("alert+accept 流程收尾(工具报错→accept→恢复)", !dialogErr && recovered, dialogErr ?? "");
   snap = bu(["take_snapshot", "--session", sessionId]);
   const confirmUid = parseSnapUid(snap, "弹 confirm");
   let confirmErr = null;
   try {
     bu(["click", "--session", sessionId, confirmUid]);
+  } catch (e) { if (!/未处理|dialog/i.test(e.message)) confirmErr = e.message; }
+  try {
     bu(["handle_dialog", "--session", sessionId, "accept"]);
-  } catch (e) { confirmErr = e.message; }
-  ok("confirm+accept 流程收尾", !confirmErr, confirmErr ?? "");
+  } catch (e) { confirmErr = (confirmErr ?? "") + " / accept: " + e.message; }
+  let confirmLog = "";
+  try {
+    const ev = JSON.parse(bu(["evaluate_script", "--session", sessionId,
+      "() => document.getElementById('log').textContent", "--output-format=json"]));
+    confirmLog = String(ev.value ?? "");
+  } catch { /* 未恢复 */ }
+  ok("confirm+accept 回执写入 log", !confirmErr && confirmLog.includes("confirm-result=true"), confirmErr ?? confirmLog.slice(0, 100));
 
   // ---- 9. cookie 管道(会话实例内 set→echo) ----
   console.log("\n[9] cookie 管道");

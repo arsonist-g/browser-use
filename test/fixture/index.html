@@ -24,6 +24,8 @@
 <section id="sec-basic">
   <h2>基础元素</h2>
   <button id="btn-log" onclick="log('basic-button-clicked')">基础按钮</button>
+  <button id="btn-hover" onmouseenter="log('hover-entered')">悬停目标</button>
+  <span id="drag-src" style="display:inline-block;padding:4px 10px;border:1px solid #999;user-select:none;">拖拽源</span>
   <a id="link-iana" href="https://www.iana.org/help/example-domains">外链</a>
   <a id="link-newtab" href="child.html" target="_blank">新窗口打开子页</a>
 </section>
@@ -42,6 +44,9 @@
   <label><input id="f-agree" type="checkbox"> 同意条款</label>
   <label>简介 <textarea id="f-bio" rows="2"></textarea></label>
   <label>附件 <input id="f-file" type="file" aria-label="附件上传"></label>
+  <button id="btn-upload-proxy" onclick="document.getElementById('f-file-hidden').click()">代理上传</button>
+  <input id="f-file-hidden" type="file" style="display:none"
+         onchange="log('proxy-file-selected=' + (this.files.length ? this.files[0].name : 'none'))">
   <button id="btn-submit" onclick="submitForm()">提交表单</button>
   <div id="form-result">(尚未提交)</div>
 </section>
@@ -103,6 +108,19 @@ function log(msg) {
   sr.querySelector('button').addEventListener('click', () => log('closed-shadow-clicked'));
 })();
 
+// mouse 路径拖拽消费(与 cdt 默认 drag 语义同路径:mouse 事件序列而非 HTML5 DnD)
+(() => {
+  const src = document.getElementById('drag-src');
+  let sx = 0, sy = 0, dragging = false;
+  src.addEventListener('mousedown', (e) => { dragging = true; sx = e.clientX; sy = e.clientY; });
+  window.addEventListener('mouseup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 10)
+      log(`drag-done(${sx},${sy})->(${e.clientX},${e.clientY})`);
+  });
+})();
+
 function submitForm() {
   const name = document.getElementById('f-name').value;
   const city = document.getElementById('f-city').value;
@@ -157,6 +175,39 @@ function rebuildList() {
 document.getElementById('f-file').addEventListener('change', (e) => {
   const fs = e.target.files;
   log('file-selected=' + (fs.length ? fs[0].name : 'none') + ' count=' + fs.length);
+});
+
+// console 收割样本(list_console_messages / get_console_message 断言用)
+console.log('bu-fixture-loaded');
+console.warn('bu-fixture-warning');
+
+// WebMCP 注册(flag 未开时 modelContext 不存在,防御式跳过)
+if (document.modelContext) {
+  document.modelContext.registerTool({
+    name: 'get-fixture-title',
+    description: '返回夹具页标题',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    execute: () => document.title,
+  });
+}
+
+// Third-party DevTools 工具注册(cdt devtoolstooldiscovery 发现协议)
+window.addEventListener('devtoolstooldiscovery', (event) => {
+  event.respondWith({
+    name: 'fixture-tools',
+    description: '测试用第三方开发者工具组',
+    tools: [{
+      name: 'get-fixture-h1',
+      description: '返回页面 H1 文本',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      execute: () => document.querySelector('h1').textContent,
+    }, {
+      name: 'echo-thing',
+      description: '回显入参中的 thing 字段',
+      inputSchema: { type: 'object', properties: { thing: { type: 'string' } }, required: ['thing'] },
+      execute: (args) => ({ echoed: args.thing }),
+    }],
+  });
 });
 </script>
 </body>

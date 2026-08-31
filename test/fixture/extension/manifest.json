@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "BU Test Extension",
+  "version": "1.0",
+  "description": "Browser-Use extensions toolset test fixture",
+  "background": { "service_worker": "sw.js" },
+  "action": {}
+}

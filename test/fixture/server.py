@@ -14,7 +14,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 FIXTURE_DIR = Path(__file__).parent
-MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css"}
+MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
+        ".webmanifest": "application/manifest+json", ".json": "application/json",
+        ".png": "image/png"}
 
 
 class Handler(BaseHTTPRequestHandler):
