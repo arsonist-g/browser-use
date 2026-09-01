@@ -32,7 +32,7 @@ function parseSnapUid(text, labelIncludes) {
 }
 
 const serverProc = spawn(process.platform === "win32" ? "python" : "python3",
-  [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT)], { stdio: "ignore" });
+  [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT)], { stdio: "ignore", windowsHide: true });
 let sessionId = null;
 
 async function main() {

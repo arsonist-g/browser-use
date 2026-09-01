@@ -79,10 +79,11 @@ function daemonAlive() {
 
 async function ensureDaemon() {
   if (await daemonAlive()) return;
-  // 单例探活失败 → 后台拉起(分离进程,不随 CLI 退出)
+  // 单例探活失败 → 后台拉起(分离进程,不随 CLI 退出)。windowsHide:detached 会让
+  // node 子进程开自己的控制台(黑窗常驻),必须显式隐藏
   const daemonJs = path.join(ROOT, "lib", "daemon.mjs");
   const child = spawn(process.execPath, [daemonJs], {
-    detached: true, stdio: "ignore",
+    detached: true, stdio: "ignore", windowsHide: true,
     env: { ...process.env },
   });
   child.unref();
@@ -109,7 +110,7 @@ async function main() {
   const argv = process.argv.slice(2);
   // 通用解析:--flag value / --boolFlag / 位置参数(工具参数各异,不再逐一声明)
   const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
-    "headless", "bringToFront", "fix"]);
+    "headless", "bringToFront", "fix", "dry-run", "force"]);
   const values = {};   // flags
   const positionals = [];
   for (let i = 1; i < argv.length; i++) {
@@ -127,7 +128,7 @@ async function main() {
     }
   }
   const command = argv[0];
-  if (!command || command === "--help" || command === "-h" || command === "help") {
+  if (!command || command === "--help" || command === "-h") {
     out(`browser-use ${VERSION}
 usage:
   browser-use start [--headless] [--browser-exe <path>]
@@ -137,8 +138,25 @@ usage:
   browser-use <tool> --session=<id> [位置参数] [flags]   # take_snapshot/click/fill/...
   browser-use config get [k] | set <k> <v> | list | reset [k]
   browser-use extension          # 打印桥扩展目录与配对 token
-  browser-use doctor [--fix]`);
+  browser-use skill list | install --agent=<key>|--all [--force] [--dry-run] | uninstall --agent=<key>
+  browser-use doctor [--fix]
+  browser-use help <tool>        # 查看某工具的全部参数;browser-use help 列出全部工具
+参数报错时: 先 browser-use help <tool> 核对签名,再重试。`);
     return;
+  }
+  // help 路由:help <tool> → 单工具参数;help → 全部工具与命令;<tool> --help → 单工具参数
+  const { toolHelpText, helpOverviewText } = await import("../lib/tool-help.mjs");
+  if (command === "help" && positionals[0]) {
+    const t = toolHelpText(positionals[0]);
+    if (!t) die(2, `未知工具: ${positionals[0]}(browser-use help 列出全部工具)`);
+    return out(t);
+  }
+  if (command === "help") return out(helpOverviewText());
+  if (values.help) {
+    if (toolHelpText(command)) return out(toolHelpText(command));
+    const sessionCmds = new Set(["start", "stop", "sessions", "session.bare", "status", "config", "extension", "skill", "doctor"]);
+    if (sessionCmds.has(command)) return out(helpOverviewText());
+    die(2, `未知工具: ${command}(browser-use help 列出全部工具)`);
   }
 
   const jsonMode = values["output-format"] === "json";
@@ -205,6 +223,46 @@ usage:
         out(`extension_dir: ${extDir}\n\n步骤: edge://extensions → 开发者模式 → 加载解压缩的扩展(${extDir})。无感配对:daemon 在线时自动连接,无需任何配置。`);
         return;
       }
+      case "skill": {
+        const { AGENTS, skillTargetDir, skillStatus, installSkill, uninstallSkill } = await import("../lib/skills.mjs");
+        const os = await import("node:os");
+        const home = os.homedir();
+        const sub = positionals[0] ?? "list";
+        const dryRun = !!values["dry-run"];
+        const rows = AGENTS.filter((a) => !values.agent || a.key === values.agent || values.agent === "all");
+        if (values.agent && !rows.length) die(2, `未知 agent: ${values.agent}(valid: ${AGENTS.map((a) => a.key).join(", ")}, all)`);
+        if (sub === "list") {
+          const list = rows.map((a) => { const d = skillTargetDir(a.key, home); return { agent: a.key, label: a.label, dir: d, state: skillStatus(ROOT, d).state }; });
+          if (jsonMode) return outJson({ agents: list });
+          return out(list.map((r) => `${r.agent.padEnd(12)} ${r.state.padEnd(13)} ${r.dir}`).join("\n"));
+        }
+        if (sub === "install" || sub === "update") {
+          if (!rows.length) die(2, "install 需要 --agent=<key> 或 --all");
+          const results = [];
+          for (const a of rows) {
+            const dest = skillTargetDir(a.key, home);
+            if (dryRun) { results.push({ agent: a.key, dir: dest, dry_run: true, state: skillStatus(ROOT, dest).state }); continue; }
+            const r = installSkill(ROOT, dest, !!values.force);
+            results.push(r.ok ? { agent: a.key, dir: dest, installed: true, files: r.files }
+              : { agent: a.key, dir: dest, installed: false, reason: "目标已存在且与包内版本不同;确认覆盖请加 --force" });
+          }
+          if (jsonMode) return outJson({ results });
+          for (const r of results) {
+            if (r.dry_run) out(`[dry-run] ${r.agent} → ${r.dir}(当前 ${r.state},未写入)`);
+            else if (r.installed) out(`installed ${r.agent} → ${r.dir}(${r.files} files)`);
+            else errOut(`error[INVALID_ARG]: ${r.agent}: ${r.reason}\n`);
+          }
+          if (results.some((r) => !r.installed && !r.dry_run)) process.exitCode = 2;
+          return;
+        }
+        if (sub === "uninstall") {
+          if (!rows.length) die(2, "uninstall 需要 --agent=<key>");
+          const results = rows.map((a) => { const dest = skillTargetDir(a.key, home); return { agent: a.key, dir: dest, removed: uninstallSkill(dest) }; });
+          if (jsonMode) return outJson({ results });
+          return out(results.map((r) => `${r.removed ? "removed" : "not present"} ${r.agent}: ${r.dir}`).join("\n"));
+        }
+        return die(2, `用法: browser-use skill list | install --agent=<key>|--all [--force] [--dry-run] | uninstall --agent=<key>`);
+      }
       case "doctor": {
         return cmdDoctor(values.fix, jsonMode);
       }
@@ -216,13 +274,14 @@ usage:
         const pos = TOOL_POS[command] ?? [];
         pos.forEach((k, i) => { if (positionals[i] !== undefined) args[k] = positionals[i]; });
         for (const [k, v] of Object.entries(values)) {
-          if (v === undefined || k === "output-format" || k === "session" || k === "timeout" || k === "fix") continue;
+          if (v === undefined || k === "output-format" || k === "session" || k === "fix") continue;
           let typed = v;   // 布尔字面量转真布尔(--reload false 否则会成字符串 "false")
           if (v === "true") typed = true;
           else if (v === "false") typed = false;
           args[k.replace(/-/g, "_")] = typed;   // kebab → snake(--snapshot-id → snapshot_id)
         }
         const r = await rpc("tool.call", { session_id: sid, tool: command, args,
+          // --timeout 双语义:rpc 层总超时 + 工具级参数(wait_for/navigate_page 的 core 契约,毫秒)
           timeout_ms: values.timeout ? Number(values.timeout) : undefined });
         if (jsonMode) return outJson(r);
         return out(fmtResult(command, r));
@@ -248,7 +307,7 @@ async function cmdDoctor(fix, jsonMode) {
   add("node", Number(process.versions.node.split(".")[0]) >= 20, `node ${process.versions.node}`);
   // python
   const py = await new Promise((resolve) => {
-    const p = spawn("python", ["--version"]);
+    const p = spawn("python", ["--version"], { windowsHide: true });
     let o = "";
     p.stdout.on("data", (d) => (o += d)); p.stderr.on("data", (d) => (o += d));
     p.on("close", () => resolve(o.trim()));
@@ -257,7 +316,7 @@ async function cmdDoctor(fix, jsonMode) {
   add("python", !!py && /3\.(1[0-9]|[2-9][0-9])/.test(py ?? ""), py ?? "python 不可用");
   // DrissionPage
   const dp = await new Promise((resolve) => {
-    const p = spawn("python", ["-c", "import DrissionPage"]);
+    const p = spawn("python", ["-c", "import DrissionPage"], { windowsHide: true });
     p.on("close", (c) => resolve(c === 0 ? "installed" : null));
     p.on("error", () => resolve(null));
   });
@@ -274,14 +333,24 @@ async function cmdDoctor(fix, jsonMode) {
     if (checks.find((c) => c.name === "DrissionPage" && !c.ok)) {
       const coreDir = path.join(ROOT, "core");
       await new Promise((resolve) => {
-        const p = spawn("python", ["-m", "pip", "install", "-e", coreDir], { stdio: "inherit", shell: true });
+        const p = spawn("python", ["-m", "pip", "install", "-e", coreDir], { stdio: "inherit", shell: true, windowsHide: true });
         p.on("close", resolve);
       });
     }
   }
   const allOk = checks.every((c) => c.ok);
-  if (jsonMode) return outJson({ ok: allOk, checks });
+  // skill 安装状态:信息项,不计入环境 ok 判定
+  let skillInfo;
+  try {
+    const { AGENTS, skillTargetDir, skillStatus } = await import("../lib/skills.mjs");
+    const home = (await import("node:os")).homedir();
+    const states = AGENTS.map((a) => ({ agent: a.key, state: skillStatus(ROOT, skillTargetDir(a.key, home)).state }));
+    const n = states.filter((s) => s.state !== "not_installed").length;
+    skillInfo = { installed: n, of: AGENTS.length, states };
+  } catch { /* skills 目录缺失时 doctor 其余检查照常 */ }
+  if (jsonMode) return outJson({ ok: allOk, checks, skill: skillInfo });
   for (const c of checks) out(`${c.ok ? "✔" : "✘"} ${c.name}: ${c.detail}`);
+  if (skillInfo) out(`ℹ skill: installed for ${skillInfo.installed}/${skillInfo.of} agents(安装: browser-use skill install --agent=claude-code)`);
   process.exitCode = allOk ? 0 : 3;
 }
 

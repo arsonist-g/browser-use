@@ -6,5 +6,5 @@ __pycache__/
 daemon.log*
 profiles/
 tmp-doc/
-project-memory/
 *.heapsnapshot
+daemon.pid

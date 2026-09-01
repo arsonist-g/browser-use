@@ -3,7 +3,21 @@
   "version": "0.1.0",
   "description": "AI browser automation driven by the machine's daily browser: session-scoped cookie injection, DrissionPage core, dedicated bridge. CLI bin: browser-use",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arsonist-g/browser-use.git"
+  },
   "type": "module",
+  "files": [
+    "bin/",
+    "lib/",
+    "core/",
+    "!core/bu_core.egg-info/",
+    "!core/**/__pycache__/",
+    "extension/",
+    "skills/",
+    "README-ZH.md"
+  ],
   "bin": {
     "browser-use": "bin/browser-use.mjs"
   },
@@ -15,7 +29,7 @@
   },
   "scripts": {
     "start": "node bin/browser-use.mjs",
-    "test": "node --test test/unit/core.test.mjs",
+    "test": "node --test test/unit/core.test.mjs test/unit/skills.test.mjs test/unit/tool-help.test.mjs",
     "e2e": "node test/e2e.mjs",
     "all-tools": "node test/all-tools.mjs"
   }
