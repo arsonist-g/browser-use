@@ -1,6 +1,6 @@
 {
   "name": "@arsonist-g/browser-use",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AI browser automation driven by the machine's daily browser: session-scoped cookie injection, DrissionPage core, dedicated bridge. CLI bin: browser-use",
   "license": "MIT",
   "repository": {
