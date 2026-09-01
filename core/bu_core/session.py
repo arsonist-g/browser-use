@@ -64,6 +64,8 @@ class BrowserSession:
         self.listen_started = False
         self.console_started = False
         self.uid_map = {}   # uid -> a11y node(backendNodeId 等)
+        self.uid_frames = {}  # uid -> OOPIF 子 sessionId(空 = 主 frame)
+        self.uid_hosts = {}   # uid -> 宿主 iframe backendNodeId(OOPIF 截图坐标换算用)
         self.snapshot_seq = 0
 
     def start(self):

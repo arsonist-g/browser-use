@@ -123,6 +123,16 @@ async function main() {
       "() => document.getElementById('f-name').value", "--output-format=json"]));
     mark("type_text", r.value === "pre-s-typed" ? "PASS" : "FAIL", `value=${JSON.stringify(r.value)}`);
   } catch (e) { mark("type_text", "FAIL", e.message); }
+  // press_key 组合键:Control+a 全选后单键替换(防退化断言:humanize._vk 曾因
+  // 模块级重复定义被简化版覆盖,组合键全灭 invalid)
+  try {
+    bu(["fill", "--session", sessionId, nameUid, "before-select-all"]);
+    bu(["press_key", "--session", sessionId, "Control+a"]);
+    bu(["press_key", "--session", sessionId, "X"]);
+    const r = JSON.parse(bu(["evaluate_script", "--session", sessionId,
+      "() => document.getElementById('f-name').value", "--output-format=json"]));
+    mark("press_key(Control+a)", r.value === "X" ? "PASS" : "FAIL", `value=${JSON.stringify(r.value)}`);
+  } catch (e) { mark("press_key(Control+a)", "FAIL", e.message); }
   const fileUid = parseSnapUid(snap, "附件上传");
   const tmpUp = path.join(ROOT, "test", "fixture", "upload-sample.txt");
   try { bu(["upload_file", "--session", sessionId, fileUid, tmpUp]); mark("upload_file", readLog().includes("file-selected=upload-sample.txt") ? "PASS" : "FAIL", readLog().slice(0, 90)); } catch (e) { mark("upload_file", "FAIL", e.message); }
@@ -388,8 +398,11 @@ async function main() {
       const r = J(["get_heapsnapshot_retaining_paths", ...HS, "--output-format=json", "--nodeId", "1"]);
       const p0 = (r.paths ?? [])[0];
       const toRoot = (p0?.chain ?? []).some(c => c.type === "Root" || c.type === "Synthetic");
-      mark("get_heapsnapshot_retaining_paths", (r.paths ?? []).length > 0 && (toRoot || p0.chain.length >= 1) ? "PASS" : "FAIL",
-        `paths=${r.paths?.length} 首链深=${p0?.depth}`);
+      // 有链:链必须真实(含 Root/Synthetic);无链:对齐 cdt 返回空 + 提示行(不伪造路径)
+      const withPaths = (r.paths ?? []).length > 0 && (toRoot || p0.chain.length >= 1);
+      const emptyOk = (r.paths ?? []).length === 0 && typeof r.note === "string";
+      mark("get_heapsnapshot_retaining_paths", withPaths || emptyOk ? "PASS" : "FAIL",
+        `paths=${r.paths?.length} 首链深=${p0?.depth} note=${r.note ?? "-"}`);
     } catch (e) { mark("get_heapsnapshot_retaining_paths", "FAIL", e.message); }
     try {
       const r = J(["get_heapsnapshot_dominators", ...HS, "--output-format=json", "--nodeId", "1"], 240000);

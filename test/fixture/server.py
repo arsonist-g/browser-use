@@ -3,10 +3,12 @@
 
 GET /            → index.html
 GET /child.html  → 子页
+GET /xo-host     → 跨域 iframe 宿主页(iframe 指向 127.0.0.2 同端口,site isolation → OOPIF)
 GET /set-cookie  → Set-Cookie: bu_e2e=<ts>; Path=/(会话实例种 cookie 用)
 GET /echo-cookie → 响应体 = 请求头里的 Cookie 原文(验证请求真实携带)
 其余 /<file>     → test/fixture/ 下静态文件
-用法: python server.py [port](默认 18123,仅 127.0.0.1)
+用法: python server.py [port] [host](默认 18123 @ 127.0.0.1;跨域宿主页需在
+      127.0.0.2 上再起一个同端口实例——回环整段本机可达,host 不同 = 跨站)
 """
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -14,6 +16,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 FIXTURE_DIR = Path(__file__).parent
+BIND_PORT = 18123
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
         ".webmanifest": "application/manifest+json", ".json": "application/json",
         ".png": "image/png"}
@@ -38,7 +41,18 @@ class Handler(BaseHTTPRequestHandler):
                        {"Set-Cookie": f"bu_e2e={ts}; Path=/; SameSite=Lax"})
         elif path == "/echo-cookie":
             cookie = self.headers.get("Cookie", "(none)")
-            self._send(200, f"echo-cookie: {cookie}")
+            self._send(200, f"echo-cookie: {cookie}", {"Content-Type": "text/html; charset=utf-8"})
+        elif path == "/xo-host":
+            # 动态注入端口(与第二个 127.0.0.2 实例同端口);不同 host = 跨站 → OOPIF
+            html = f"""<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>BU Fixture 跨域 iframe</title></head>
+<body>
+<h2>跨域 iframe 宿主页</h2>
+<iframe id="xo" src="http://127.0.0.2:{BIND_PORT}/child.html" style="width:420px;height:220px;border:1px solid #888"></iframe>
+</body>
+</html>"""
+            self._send(200, html, {"Content-Type": "text/html; charset=utf-8"})
         else:
             fp = FIXTURE_DIR / path.lstrip("/") if path != "/" else FIXTURE_DIR / "index.html"
             if fp.is_file() and FIXTURE_DIR in fp.resolve().parents or fp.parent == FIXTURE_DIR:
@@ -54,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 18123
-    server = HTTPServer(("127.0.0.1", port), Handler)
-    print(f"fixture server on http://127.0.0.1:{port}", flush=True)
+    host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    BIND_PORT = port
+    server = HTTPServer((host, port), Handler)
+    print(f"fixture server on http://{host}:{port}", flush=True)
     server.serve_forever()

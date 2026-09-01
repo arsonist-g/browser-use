@@ -64,6 +64,10 @@ def screencast_start(sess, args, session_dir):
     if getattr(sess, "_cdp", None) is None:
         from .cdp_events import ensure_session_cdp
         ensure_session_cdp(sess)
+    if getattr(sess, "_casting", False):
+        # cdt 语义:单槽——已录制时返回 Error 行,不动原槽(帧计数/目录保持)
+        return {"started": False,
+                "error": "a screencast recording is already in progress. Stop it before starting a new one."}
     sess._cast_dir = sess.artifact_path(session_dir, "screencast", "frames")
     os.makedirs(sess._cast_dir, exist_ok=True)
     sess._cast_frames = 0
@@ -118,10 +122,18 @@ def screencast_collect(sess, args, session_dir):
 
 def click_at(sess, args, session_dir):
     from . import humanize
+    from .tools import _check_dialog, _wait_after_action, _with_snapshot
+    _check_dialog(sess)
     x, y = float(args["x"]), float(args["y"])
-    humanize.click_xy(sess.t, x, y, dbl=bool(args.get("dblClick")))
+    try:
+        humanize.click_xy(sess.t, x, y, dbl=bool(args.get("dblClick")))
+    except TimeoutError:
+        pass  # 弹窗在按下/抬起间弹出:点击已发生,dialog 交给 AI(同 click)
     humanize.op_delay()
-    return {"clicked": True, "x": x, "y": y}
+    nav = _wait_after_action(sess)
+    return _with_snapshot(sess, args.get("includeSnapshot"),
+                          {"clicked": True, "x": x, "y": y,
+                           **({"navigated_to_url": nav} if nav else {})})
 
 
 # ---- Third-party(页面侧 devtoolstooldiscovery 发现协议,对齐 cdt McpPage.getToolGroups) ----
@@ -303,9 +315,14 @@ def execute_webmcp_tool(sess, args, session_dir):
         tools = getattr(sess, "_webmcp_tools", {})
     t = tools.get(name)
     if not t:
-        raise KeyError(f"WebMCP 工具未找到: {name}(list_webmcp_tools 查看可用工具)")
+        raise ValueError(f"Tool {name} not found")  # 文案对齐 cdt webmcp.ts
     inp = args.get("input")
-    input_obj = json.loads(inp) if isinstance(inp, str) else (inp or {})
+    try:
+        input_obj = json.loads(inp) if isinstance(inp, str) else (inp or {})
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse input as JSON: {e}") from None
+    if not isinstance(input_obj, dict):
+        raise ValueError("Parsed input is not an object")  # 文案对齐 cdt
     cdp = _webmcp_cdp(sess)
     r = cdp.call("WebMCP.invokeTool", frameId=t.get("frameId"), toolName=name, input=input_obj)
     inv = r.get("invocationId")

@@ -36,27 +36,31 @@ def bezier_path(x0, y0, x1, y1, steps=None):
     return pts
 
 
-def move_mouse(tab, x, y):
-    """从当前(last)位置拟人移动到 (x, y)。M1 以 (0,0) 起点可接受——后续保存上一坐标。"""
+def move_mouse(tab, x, y, dispatch=None):
+    """从当前(last)位置拟人移动到 (x, y)。M1 以 (0,0) 起点可接受——后续保存上一坐标。
+    dispatch:Input 域发送通道,默认 tab.run_cdp;OOPIF 元素传其子 session 调用器
+    (坐标系为该 frame 自身视口,与 DOM.getContentQuads 一致)。"""
+    send = dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
     last = getattr(tab, "_bu_last_mouse", (x, y))
     for px, py in bezier_path(last[0], last[1], x, y):
-        tab.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py)
+        send("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py)
         import time
         time.sleep(random.uniform(0.008, 0.016))
     tab._bu_last_mouse = (x, y)
 
 
-def click_xy(tab, x, y, dbl=False):
+def click_xy(tab, x, y, dbl=False, dispatch=None):
     import time
-    move_mouse(tab, x, y)
+    send = dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
+    move_mouse(tab, x, y, dispatch)
     time.sleep(_gauss(0.06, 0.13))
     common = dict(x=x, y=y, button="left", clickCount=1)
-    tab.run_cdp("Input.dispatchMouseEvent", type="mousePressed", **common)
+    send("Input.dispatchMouseEvent", type="mousePressed", **common)
     time.sleep(_gauss(0.06, 0.13))
-    tab.run_cdp("Input.dispatchMouseEvent", type="mouseReleased", **common)
+    send("Input.dispatchMouseEvent", type="mouseReleased", **common)
     if dbl:
-        tab.run_cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=2)
-        tab.run_cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=2)
+        send("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=2)
+        send("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=2)
 
 
 def type_text(tab, text, submit_key=None):
@@ -79,6 +83,8 @@ _NAMED_VK = {
     "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34, "Space": 32, " ": 32,
     "Insert": 45, "Pause": 19, "CapsLock": 20, "NumLock": 144, "ScrollLock": 145,
     "ContextMenu": 93,
+    # 逻辑修饰键名(puppeteer KeyInput;物理名 ShiftLeft 等在下方)
+    "Shift": 16, "Control": 17, "Alt": 18, "Meta": 91,
     "ShiftLeft": 160, "ShiftRight": 161, "ControlLeft": 162, "ControlRight": 163,
     "AltLeft": 164, "AltRight": 165, "MetaLeft": 91, "MetaRight": 92,
     "Numpad0": 96, "Numpad1": 97, "Numpad2": 98, "Numpad3": 99, "Numpad4": 100,
@@ -141,44 +147,35 @@ def parse_key(key_input):
 
 def press_key(tab, key):
     """Enter/Control+A 形式;修饰键按住→主键→释放。可打印字符走 keyDown(text)
-    使其产生实际输入(对齐 puppeteer press 语义,rawKeyDown 不生成字符)。"""
+    使其产生实际输入(对齐 puppeteer press 语义,rawKeyDown 不生成字符)。
+    中途抛错时 finally 逆序释放已按下的修饰键(上游 #2309),避免修饰键逻辑卡死。"""
     import time
     main, *mods = parse_key(key)
     modifiers = 0
-    for m in mods:
-        modifiers |= {"Control": 2, "Alt": 1, "Shift": 8, "Meta": 4}[m]
-        tab.run_cdp("Input.dispatchKeyEvent", type="rawKeyDown",
-                    key=m, code=f"{m}Left", modifiers=modifiers, windowsVirtualKeyCode=_vk(m))
-    time.sleep(_gauss(0.03, 0.09))
-    code = _vk(main)
-    code_field = f"Key{main}" if len(main) == 1 and main.isalpha() else main
-    printable = len(main) == 1 and not mods and main.isprintable()
-    main_type = "keyDown" if printable else "rawKeyDown"
-    down_kwargs = dict(type=main_type, key=main, code=code_field,
-                       windowsVirtualKeyCode=code, modifiers=modifiers)
-    if printable:
-        down_kwargs["text"] = main
-        down_kwargs["unmodifiedText"] = main
-    tab.run_cdp("Input.dispatchKeyEvent", **down_kwargs)
-    tab.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=main,
-                code=code_field, windowsVirtualKeyCode=code, modifiers=modifiers)
-    for m in reversed(mods):
-        modifiers -= {"Control": 2, "Alt": 1, "Shift": 8, "Meta": 4}[m]
-        tab.run_cdp("Input.dispatchKeyEvent", type="keyUp",
-                    key=m, code=f"{m}Left", modifiers=modifiers)
-
-
-def _vk(key):
-    named = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, "Delete": 46,
-             "ArrowUp": 38, "ArrowDown": 40, "ArrowLeft": 37, "ArrowRight": 39,
-             "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34, "Space": 32}
-    if key in named:
-        return named[key]
-    if len(key) == 1 and key.isalpha():
-        return ord(key.upper())
-    if key.isdigit():
-        return ord(key)
-    return 0
+    pressed = []
+    try:
+        for m in mods:
+            modifiers |= {"Control": 2, "Alt": 1, "Shift": 8, "Meta": 4}[m]
+            tab.run_cdp("Input.dispatchKeyEvent", type="rawKeyDown",
+                        key=m, code=f"{m}Left", modifiers=modifiers, windowsVirtualKeyCode=_vk(m))
+            pressed.append((m, modifiers))
+        time.sleep(_gauss(0.03, 0.09))
+        code = _vk(main)
+        code_field = f"Key{main}" if len(main) == 1 and main.isalpha() else main
+        printable = len(main) == 1 and not mods and main.isprintable()
+        main_type = "keyDown" if printable else "rawKeyDown"
+        down_kwargs = dict(type=main_type, key=main, code=code_field,
+                           windowsVirtualKeyCode=code, modifiers=modifiers)
+        if printable:
+            down_kwargs["text"] = main
+            down_kwargs["unmodifiedText"] = main
+        tab.run_cdp("Input.dispatchKeyEvent", **down_kwargs)
+        tab.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=main,
+                    code=code_field, windowsVirtualKeyCode=code, modifiers=modifiers)
+    finally:
+        for m, mods_bit in reversed(pressed):
+            tab.run_cdp("Input.dispatchKeyEvent", type="keyUp",
+                        key=m, code=f"{m}Left", modifiers=mods_bit)
 
 
 def op_delay():

@@ -47,6 +47,11 @@ function safeBu(name, args, timeoutMs = 60000) {
 const serverProc = spawn(process.platform === "win32" ? "python" : "python3",
   [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT)],
   { stdio: "ignore", windowsHide: true });
+// 跨域 iframe 宿主页需要 127.0.0.2 上的同端口第二实例(host 不同 = 跨站 → OOPIF;
+// 实测 127.0.0.1 双端口不产生 OOPIF——site isolation 按 host 不按端口)
+const serverProc2 = spawn(process.platform === "win32" ? "python" : "python3",
+  [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT), "127.0.0.2"],
+  { stdio: "ignore", windowsHide: true });
 let sessionId = null;
 
 async function main() {
@@ -190,12 +195,29 @@ async function main() {
   snap = bu(["take_snapshot", "--session", sessionId]);
   ok("会话 cookie 栈(set→echo 回读 bu_e2e)", snap.includes("bu_e2e="));
 
-  // ---- 10. iframe(xfail 探测:主 frame a11y 树是否含子 frame 内容) ----
-  console.log("\n[10] iframe(xfail 探测)");
+  // ---- 10. iframe:同 host(同进程,主树直含)+ 跨域(OOPIF,per-frame 拼树) ----
+  console.log("\n[10] iframe 穿透");
   bu(["navigate_page", "--session", sessionId, `${BASE}/`]);
   snap = bu(["take_snapshot", "--session", sessionId]);
-  if (snap.includes("子页按钮")) { pass++; console.log("  ✔ iframe 内容已进入快照"); }
-  else { skip("iframe 内容进快照", "已知限制:getFullAXTree 仅主 frame,M2 经 ChromiumFrame 拼接"); }
+  ok("同 host iframe 内容在快照", snap.includes("子页按钮"));
+  // 跨域:iframe 加载 + OOPIF target 建立需要时间,navigate 只等主文档
+  bu(["navigate_page", "--session", sessionId, `${BASE}/xo-host`]);
+  await new Promise(r => setTimeout(r, 2000));
+  snap = bu(["take_snapshot", "--session", sessionId]);
+  ok("跨域 iframe 内容进快照(子页按钮)", snap.includes("子页按钮"),
+     "OOPIF 拼树未生效——检查 take_snapshot 的 per-frame 拼接");
+  const xoUid = parseSnapUid(snap, "子页按钮");
+  ok("跨域 iframe 内按钮取得 uid", !!xoUid);
+  if (xoUid) {
+    bu(["click", "--session", sessionId, xoUid]);
+    snap = bu(["take_snapshot", "--session", sessionId]);
+    ok("跨域 iframe 内点击生效(child-clicked)", snap.includes("child-clicked"),
+       "uid 消费未按 frame session 路由或点击未达子 frame");
+    // uid 随快照轮换:截图用最新快照的 uid
+    const xoUid2 = parseSnapUid(snap, "子页按钮");
+    try { bu(["take_screenshot", "--session", sessionId, "--uid", xoUid2]); ok("跨域 iframe 元素截图", true); }
+    catch (e) { ok("跨域 iframe 元素截图", false, e.message.slice(0, 120)); }
+  }
 
   // ---- 11. stop ----
   console.log("\n[11] 收尾");
@@ -211,6 +233,7 @@ try {
   if (sessionId) { try { bu(["stop", "--session", sessionId]); } catch { /* */ } }
 } finally {
   try { serverProc.kill(); } catch { /* */ }
+  try { serverProc2.kill(); } catch { /* */ }
   console.log(`\n===== e2e 汇总: pass=${pass} fail=${fail} skip=${skipped} =====`);
   if (fails.length) console.log("失败项:\n  - " + fails.join("\n  - "));
   process.exit(fail > 0 ? 1 : 0);

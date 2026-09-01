@@ -101,7 +101,12 @@ function fmtResult(tool, r) {
   if (tool === "list_pages" && r?.pages) {
     return r.pages.map((p) => `page ${p.page_id}: ${p.title}  ${p.url}`).join("\n");
   }
-  if (r?.snapshot) return `${r.snapshot}\n`;
+  // 附快照的结果(wait_for 命中 / --includeSnapshot):键值行在前,快照正文随后
+  if (r?.snapshot) {
+    const rest = Object.entries(r).filter(([k]) => k !== "snapshot")
+      .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`).join("\n");
+    return rest ? `${rest}\n${r.snapshot}\n` : `${r.snapshot}\n`;
+  }
   return Object.entries(r ?? {}).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`).join("\n");
 }
 

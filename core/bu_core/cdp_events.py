@@ -37,7 +37,7 @@ def pipe_call(session_id, method, timeout=30, **params):
 
 
 class CdpEvents:
-    def __init__(self, port, timeout=60, recv_granularity=1):
+    def __init__(self, port, timeout=60, recv_granularity=0.25):
         self.port = port
         self.timeout = timeout          # 命令级超时
         self.recv_granularity = recv_granularity  # 单次 recv 阻塞上限
@@ -46,10 +46,13 @@ class CdpEvents:
         self._id = 0
         self.events = []          # (method, params) 事件队列
         self.responses = {}       # id -> result/error(命令响应)
+        self._abandoned = set()   # 超时放弃的命令 id(pump 收到迟到响应即弃)
+        self.child_sessions = {}  # OOPIF 子 sessionId -> targetInfo(flatten auto-attach 登记)
+        self.dialog_state = None  # 挂起的 JS 弹窗 {"type","message"};None=无(javascriptDialogOpening/Closed 登记)
 
     def connect(self, target_id=None):
         """连接调试端口上的 page target;优先绑定指定 target(tab 侧一致性),
-        否则退回 pages[0]。"""
+        否则退回 pages[0]。Page.enable 用于弹窗状态跟踪(fileChooser 拦截也依赖)。"""
         targets = json.loads(urllib.request.urlopen(
             f"http://127.0.0.1:{self.port}/json/list", timeout=5).read())
         pages = [t for t in targets if t.get("type") == "page"]
@@ -60,6 +63,11 @@ class CdpEvents:
         self.target_id = pick.get("id")
         self.ws = websocket.create_connection(pick["webSocketDebuggerUrl"],
                                               timeout=self.recv_granularity, suppress_origin=True)
+        self.child_sessions.clear()  # 重连后 auto-attach 层级失效,由 ensure_oopif_attach 重建
+        try:
+            self.send("Page.enable")
+        except Exception:
+            pass
         return self
 
     def reconnect(self):
@@ -69,24 +77,30 @@ class CdpEvents:
         self.responses.clear()
         return self.connect(self.target_id)
 
-    def send(self, method, **params):
-        """发送命令,不等待响应(响应由 pump 收进 responses)。断线时重连重发一次。"""
+    def send(self, method, session_id=None, **params):
+        """发送命令,不等待响应(响应由 pump 收进 responses)。断线时重连重发一次。
+        session_id:flatten 子 session(OOPIF)时作为消息顶层 sessionId 路由。"""
         self._id += 1
         mid = self._id
-        msg = json.dumps({"id": mid, "method": method, "params": params})
+        msg = {"id": mid, "method": method, "params": params}
+        if session_id:
+            msg["sessionId"] = session_id
+        raw = json.dumps(msg)
         try:
-            self.ws.send(msg)
+            self.ws.send(raw)
         except Exception:
             self.reconnect()
-            self.ws.send(msg)
+            self.ws.send(raw)
         return mid
 
-    def call(self, method, timeout=None, **params):
-        """发送命令并阻塞等待其响应(路上收到的事件进 events)。"""
-        mid = self.send(method, **params)
+    def call(self, method, timeout=None, session_id=None, **params):
+        """发送命令并阻塞等待其响应(路上收到的事件进 events)。超时弃单:
+        迟到响应由 pump 按 _abandoned 丢弃,不复用不积累。"""
+        mid = self.send(method, session_id=session_id, **params)
         deadline = time.time() + (timeout or self.timeout)
         while mid not in self.responses:
             if time.time() > deadline:
+                self._abandoned.add(mid)
                 raise TimeoutError(f"CDP {method} timeout")
             self.pump()
         r = self.responses.pop(mid)
@@ -96,7 +110,10 @@ class CdpEvents:
 
     def pump(self, deadline=None):
         """非阻塞读一帧:事件入 events,命令响应入 responses。
-        连接被浏览器侧断开时置空 ws(置灰),下次 send 触发重连。"""
+        连接被浏览器侧断开时置空 ws(置灰),下次 send 触发重连。
+        Target.attached/detachedFromTarget 在此登记/注销 OOPIF 子 session;
+        javascriptDialogOpening/Closed 在此登记弹窗状态;
+        Page 域其余事件(生命周期类,无人消费)丢弃防队列膨胀。"""
         if not self.ws:
             return
         try:
@@ -114,9 +131,30 @@ class CdpEvents:
             return
         msg = json.loads(raw)
         if "id" in msg:
-            self.responses[msg["id"]] = msg
+            if msg["id"] in self._abandoned:
+                self._abandoned.discard(msg["id"])
+            else:
+                self.responses[msg["id"]] = msg
+        elif msg.get("method") == "Target.attachedToTarget":
+            ti = (msg.get("params") or {}).get("targetInfo") or {}
+            sid = (msg.get("params") or {}).get("sessionId")
+            if sid and ti.get("type") == "iframe":
+                self.child_sessions[sid] = ti
+        elif msg.get("method") == "Target.detachedFromTarget":
+            sid = (msg.get("params") or {}).get("sessionId")
+            self.child_sessions.pop(sid, None)
+        elif msg.get("method") == "Page.javascriptDialogOpening":
+            p = msg.get("params") or {}
+            self.dialog_state = {"type": p.get("type"), "message": p.get("message")}
+        elif msg.get("method") == "Page.javascriptDialogClosed":
+            self.dialog_state = None
         elif "method" in msg:
-            self.events.append((msg["method"], msg.get("params", {})))
+            m = msg["method"]
+            # Page 域生命周期事件(frameNavigated 等)无消费者,丢弃防膨胀;
+            # screencastFrame / fileChooserOpened 有消费者,保留
+            if m.startswith("Page.") and m not in ("Page.fileChooserOpened", "Page.screencastFrame"):
+                return
+            self.events.append((m, msg.get("params", {})))
 
     def drain_events(self, method_prefix=None):
         """取出(可选前缀过滤的)事件并清空队列。"""
@@ -143,3 +181,20 @@ def ensure_session_cdp(sess):
     if getattr(sess, "_cdp", None) is None:
         sess._cdp = CdpEvents(sess.port).connect(getattr(sess.t, "_target_id", None))
     return sess._cdp
+
+
+def ensure_oopif_attach(sess):
+    """page 级 flatten auto-attach OOPIF(跨域 iframe),返回 CdpEvents 单例。
+    每次重设 setAutoAttach(ws 重连后 auto-attach 状态与 child_sessions 一并丢失,
+    重设会对现存 OOPIF 重发 attachedToTarget)并 pump 收集增量;失败抛异常由调用方降级。"""
+    cdp = ensure_session_cdp(sess)
+    cdp.call("Target.setAutoAttach", autoAttach=True, waitForDebuggerOnStart=False,
+             flatten=True, timeout=10)
+    last = -1
+    deadline = time.time() + 0.6
+    while time.time() < deadline:
+        cdp.pump()
+        if cdp.child_sessions and len(cdp.child_sessions) == last:
+            break  # 无新登记即视为收齐
+        last = len(cdp.child_sessions)
+    return cdp

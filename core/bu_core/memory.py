@@ -310,27 +310,31 @@ def get_heapsnapshot_summary(sess, args, session_dir):
 
 
 def get_heapsnapshot_details(sess, args, session_dir):
-    """cdt 语义:加载快照返回聚合信息(含分页)。native context 过滤为已知降级点。"""
+    """cdt 语义:加载快照返回聚合信息(含分页)。
+    上游 filterName 是 native retention 归因枚举(objectsRetainedBy... 等 7 项),
+    本实现不支持归因,显式报错而非静默空结果。"""
     hs = _load(args.get("filePath"))
     agg = _class_aggregates(hs)
     if args.get("filterName"):
-        agg = [a for a in agg if a["name"] == args["filterName"]]
+        raise ValueError("filterName (retention attribution) is not supported; "
+                         "omit it to list class aggregates")
     total = len(agg)
     agg = _page(agg, args)
     return {"total_classes": total, "aggregates": agg}
 
 
 def get_heapsnapshot_class_nodes(sess, args, session_dir):
-    """cdt 语义:id 为 details 聚合列表中的类序号,返回该类实例节点。"""
+    """cdt 语义:id 为 details 返回的类 id(聚合对象 id 字段,单一同源),
+    按字段匹配而非列表下标(下标经排序后与 id 错位)。"""
     hs = _load(args.get("filePath"))
     retained = hs.retained_sizes()
     agg = _class_aggregates(hs)
     cid = int(args["id"])
-    if cid < 0 or cid >= len(agg):
-        raise ValueError(f"class id {cid} 不在聚合列表 0..{len(agg) - 1}(先 get_heapsnapshot_details)")
-    cname = agg[cid]["name"]
-    rows = [_node_row(hs, n, retained) for n in hs.nodes if n["name"] == cname]
-    return {"class": {"id": cid, "name": cname, "count": agg[cid]["count"]},
+    hit = next((a for a in agg if a["id"] == cid), None)
+    if hit is None:
+        raise ValueError(f"class id {cid} not found (see get_heapsnapshot_details)")
+    rows = [_node_row(hs, n, retained) for n in hs.nodes if n["name"] == hit["name"]]
+    return {"class": {"id": cid, "name": hit["name"], "count": hit["count"]},
             "nodes": _page(rows, args)}
 
 
@@ -371,8 +375,10 @@ def get_heapsnapshot_retaining_paths(sess, args, session_dir):
                 nxt.append((p, npath))
         frontier = nxt
         depth += 1
-    return {"paths": paths or [{"depth": 0,
-                                "chain": [{"nodeId": nd["index"], "name": nd["name"], "type": nd["type"]}]}]}
+    if not paths:
+        # 对齐 cdt:无 Root 可达时不伪造路径,返回空 + 提示行
+        return {"paths": [], "note": "No retaining paths found."}
+    return {"paths": paths}
 
 
 def get_heapsnapshot_edges(sess, args, session_dir):
