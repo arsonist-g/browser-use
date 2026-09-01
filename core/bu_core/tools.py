@@ -37,6 +37,16 @@ def _node_channel(sess, uid):
     return lambda m, **kw: cdp.call(m, timeout=15, session_id=sid or None, **kw)
 
 
+def _input_channel(sess):
+    """Input 域派发通道:主 session 的 ws 调用器。uid 消费的坐标已换算为主视口系,
+    主 session 派发后浏览器 hit-test 自动路由进跨域 iframe;ws 绕 DP 弹窗前置检查
+    (DEC-018)。ws 不可用回退 DP 通道。"""
+    cdp = _session_cdp_safe(sess)
+    if not cdp:
+        return lambda m, **kw: sess.t.run_cdp(m, **kw)
+    return lambda m, **kw: cdp.call(m, timeout=15, session_id=None, **kw)
+
+
 def _session_cdp_safe(sess):
     """会话级 CdpEvents(失败返回 None:预检/等待是增强,不该阻断主流程)。"""
     try:
@@ -65,10 +75,12 @@ def _cdp_eval(cdp, expr, timeout=5.0, session_id=None):
     return (r.get("result") or {}).get("value")
 
 
-def _wait_after_action(sess, timeout_s=3.0):
+def _wait_after_action(sess, timeout_s=1.5):
     """对齐上游 waitForEventsAfterAction:动作后 100ms 内检测导航发起 → 等导航完成;
-    弹窗挂起 → 跳过(上游 dialogHandled 分支);否则等 DOM 计数稳定(100ms 静默)。
-    返回 navigated_to_url | None,由响应附带给 AI(上游 "Page navigated to X." 行)。"""
+    弹窗挂起 → 跳过(上游 dialogHandled 分支);否则等 DOM 计数稳定(2 次采样相等)。
+    返回 navigated_to_url | None,由响应附带给 AI(上游 "Page navigated to X." 行)。
+    检测窗/采样间隔为 DEC-019 语义下的收紧取值(点击全链路时序预算;上游检测窗
+    即 100ms 量级)。"""
     t = sess.t
     cdp = _session_cdp_safe(sess)
 
@@ -86,7 +98,7 @@ def _wait_after_action(sess, timeout_s=3.0):
     url0 = _href()
     deadline = time.time() + timeout_s
     navigated = None
-    probe_until = time.time() + 0.8
+    probe_until = time.time() + 0.08
     while time.time() < probe_until:
         if cdp:
             cdp.pump()
@@ -96,7 +108,7 @@ def _wait_after_action(sess, timeout_s=3.0):
         if u and url0 and u != url0:
             navigated = u
             break
-        time.sleep(0.08)
+        time.sleep(0.04)
     if navigated:
         while time.time() < deadline:
             try:
@@ -119,12 +131,16 @@ def _wait_after_action(sess, timeout_s=3.0):
         if cnt == last:
             return None
         last = cnt
-        time.sleep(0.1)
+        time.sleep(0.04)
     return None
 
 
 def _uid_point(sess, uid):
-    """uid → 滚动至可见 → 视口中心坐标。视口外元素先 scrollIntoViewIfNeeded(CDP 域)。"""
+    """uid → 滚动至可见 → 中心坐标。返回 (vx, vy, fx, fy):
+    vx/vy = 主视口系(Input 派发/截图 clip 用);fx/fy = 所在 frame 自身视口系
+    (frame 内命中校验用);主 frame 元素两者相同。跨域 iframe(OOPIF)的
+    getContentQuads 返回 frame 自身视口系,经宿主链换算主视口;同进程 iframe 的
+    主 session quads 已是主视口系(Blink absolute 坐标),不换算。"""
     node = sess.uid_map.get(uid)
     if not node:
         raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
@@ -139,19 +155,101 @@ def _uid_point(sess, uid):
         raise KeyError(f"uid {uid} 无可见几何(可能不在渲染树)")
     q = quads[0]  # [x1,y1,x2,y2,...] 4 角
     xs, ys = q[0::2], q[1::2]
-    return (sum(xs) / len(xs), sum(ys) / len(ys), min(xs), min(ys), max(xs), max(ys))
+    fx = sum(xs) / len(xs)
+    fy = sum(ys) / len(ys)
+    vx, vy = fx, fy
+    if getattr(sess, "uid_frames", {}).get(str(uid)):
+        # OOPIF 子 session 的 quads 是 frame 内部系:沿宿主链累加换算主视口
+        fid = getattr(sess, "uid_frame_ids", {}).get(str(uid))
+        ox, oy = _frame_origin_in_main(sess, uid, fid)
+        vx, vy = fx + ox, fy + oy
+    return (vx, vy, fx, fy)
+
+
+# 宿主 iframe 元素 content-box 左上角(内部文档视口原点在其所在 frame 视口系的位置)
+_HOST_ORIGIN_JS = """function () {
+  const b = this.getBoundingClientRect();
+  const cs = getComputedStyle(this);
+  return {x: b.left + this.clientLeft + parseFloat(cs.paddingLeft || '0'),
+          y: b.top + this.clientTop + parseFloat(cs.paddingTop || '0')};
+}"""
+
+
+def _host_point(cdp, bnn, sid):
+    """宿主元素 content-box 原点(其所在 frame 视口系):resolveNode + callFunctionOn。
+    该 session 的 DOM agent 可能从未绑定文档(AX 拼接不走 DOM 域)——resolveNode
+    报 "does not belong to the document" 时补 DOM.getDocument(depth=0) 绑定重试一次。"""
+    try:
+        r = cdp.call("DOM.resolveNode", timeout=10, session_id=sid, backendNodeId=bnn)
+    except Exception:
+        # DOM agent 的 backendNodeId 映射只含已遍历节点:该 session 从未走 DOM 域时
+        # 任何元素都查不到(-32000 does not belong)。getDocument 全树绑定后重试。
+        cdp.call("DOM.getDocument", timeout=10, session_id=sid, depth=-1)
+        r = cdp.call("DOM.resolveNode", timeout=10, session_id=sid, backendNodeId=bnn)
+    oid = (r.get("object") or {}).get("objectId")
+    if not oid:
+        return None
+    res = cdp.call("Runtime.callFunctionOn", timeout=10, session_id=sid,
+                   objectId=oid, returnByValue=True, functionDeclaration=_HOST_ORIGIN_JS)
+    v = (res.get("result") or {}).get("value") or {}
+    return (float(v.get("x", 0)), float(v.get("y", 0)))
+
+
+def _frame_origin_in_main(sess, uid, fid):
+    """uid 所属 session 的 root frame 视口原点在主视口坐标系中的偏移:宿主链逐跳
+    累加(全 DOM 测量,禁止目测/估算)。起点不是 fid 本身——Blink 的
+    getContentQuads 返回所属 session root frame 的视口系(同进程子 frame 的 quad
+    已被折算到 session root),所以从 root 的宿主开始累加,从 fid 开始会把已折算
+    的宿主跳重复加一遍(实测落点系统性偏移恰好等于一跳)。每跳 = 测宿主 iframe
+    元素 content-box 左上角(在其所属 frame 的坐标系);父链走快照登记的
+    frame_tree/frame_owners。链断裂(快照后页面结构变化)报错指引重快照——静默
+    返回 0 偏移会点在错处,比失败更糟。"""
+    tree = getattr(sess, "frame_tree", None) or {}
+    owners = getattr(sess, "frame_owners", None) or {}
+    # 起点上溯到所属 session 的 root frame(quads 坐标系对应的 frame)
+    while fid:
+        info = tree.get(fid) or {}
+        if info.get("root") or not info.get("parent"):
+            break
+        fid = info["parent"]
+    cdp = _session_cdp_safe(sess)
+    ox = oy = 0.0
+    seen = set()
+    while fid and fid not in seen:
+        seen.add(fid)
+        info = tree.get(fid) or {}
+        if not info.get("parent"):
+            break  # 主 frame(无宿主):链顶,正常终点
+        rec = owners.get(fid)
+        if not rec or not rec[0]:
+            raise KeyError(f"uid {uid} 的 iframe 坐标换算失败(宿主链不完整),请重新 take_snapshot")
+        if not cdp:
+            break  # ws 不可用:换算不可得,维持原坐标(降级同旧行为)
+        try:
+            p = _host_point(cdp, rec[0], rec[1])
+            if p is None:
+                raise KeyError(f"uid {uid} 的 iframe 坐标换算失败(宿主元素解析为空),请重新 take_snapshot")
+            ox += p[0]
+            oy += p[1]
+        except KeyError:
+            raise
+        except Exception as e:
+            raise KeyError(f"uid {uid} 的 iframe 坐标换算失败({e}),请重新 take_snapshot") from e
+        fid = info["parent"]
+    return (ox, oy)
 
 
 def _uid_quad(sess, uid):
-    """兼容入口:取中心坐标(带滚动至可见 + 命中校验)。命中校验按 frame 路由且带超时
-    (弹窗挂起 renderer 时 run_js 会永久阻塞,一律走 CdpEvents 短超时)。"""
-    cx, cy, *_ = _uid_point(sess, uid)
+    """兼容入口:取主视口中心坐标(带滚动至可见 + frame 内命中校验)。命中校验
+    在元素所属 frame 的视口系上做(frame 内坐标 + 所属 session),带超时——弹窗
+    挂起 renderer 时 run_js 会永久阻塞,一律走 CdpEvents 短超时。"""
+    vx, vy, fx, fy = _uid_point(sess, uid)
     sid = getattr(sess, "uid_frames", {}).get(str(uid))
     hit = "unknown"
     if sid:
         try:
             hit = _cdp_eval(ensure_session_cdp(sess),
-                            f"(function(){{ const e = document.elementFromPoint({cx}, {cy});"
+                            f"(function(){{ const e = document.elementFromPoint({fx}, {fy});"
                             f" return e ? e.tagName : 'null'; }})()", timeout=8, session_id=sid)
         except Exception:
             pass
@@ -159,13 +257,13 @@ def _uid_quad(sess, uid):
         cdp = _session_cdp_safe(sess)
         if cdp:
             try:
-                hit = _cdp_eval(cdp, f"(function(){{ const e = document.elementFromPoint({cx}, {cy});"
+                hit = _cdp_eval(cdp, f"(function(){{ const e = document.elementFromPoint({vx}, {vy});"
                                      f" return e ? e.tagName : 'null'; }})()", timeout=8)
             except Exception:
                 pass
     if hit == "null":
-        raise KeyError(f"uid {uid} 滚动后仍不可点(坐标 {cx:.0f},{cy:.0f} 处无元素命中)")
-    return (cx, cy)
+        raise KeyError(f"uid {uid} 滚动后仍不可点(坐标 {fx:.0f},{fy:.0f} 处无元素命中)")
+    return (vx, vy)
 
 
 def _with_snapshot(sess, include, extra=None):
@@ -255,23 +353,23 @@ def scroll(sess, args, session_dir):
             return None
 
     if uid:
-        cx, cy = _uid_quad(sess, uid)
-        dispatch = _node_channel(sess, uid)
-        humanize.move_mouse(t, cx, cy, dispatch=dispatch)
+        vx, vy = _uid_quad(sess, uid)
+        dispatch = _input_channel(sess)
+        humanize.move_mouse(t, vx, vy, dispatch=dispatch)
     else:
         dispatch = None
         # 滚轮落点必须在内:取视口中心(写死坐标会超出小视口)
         vp = t.run_js("return [innerWidth, innerHeight]")
-        cx, cy = int(vp[0] / 2), int(vp[1] / 2)
-        humanize.move_mouse(t, cx, cy)
+        vx, vy = int(vp[0] / 2), int(vp[1] / 2)
+        humanize.move_mouse(t, vx, vy)
     dx = amount if direction == "right" else -amount if direction == "left" else 0
     dy = amount if direction == "down" else -amount if direction == "up" else 0
 
     before = _eval_in_frame("window.scrollY") or 0
     if dispatch:
-        dispatch("Input.dispatchMouseEvent", type="mouseWheel", x=cx, y=cy, deltaX=dx, deltaY=dy)
+        dispatch("Input.dispatchMouseEvent", type="mouseWheel", x=vx, y=vy, deltaX=dx, deltaY=dy)
     else:
-        t.run_cdp("Input.dispatchMouseEvent", type="mouseWheel", x=cx, y=cy,
+        t.run_cdp("Input.dispatchMouseEvent", type="mouseWheel", x=vx, y=vy,
                   deltaX=dx, deltaY=dy)
     time.sleep(0.3)
     after = _eval_in_frame("window.scrollY") or 0
@@ -280,7 +378,6 @@ def scroll(sess, args, session_dir):
         _eval_in_frame(f"window.scrollBy(0, {dy})")
         time.sleep(0.2)
         after = _eval_in_frame("window.scrollY") or 0
-    humanize.op_delay()
     return _with_snapshot(sess, args.get("includeSnapshot"),
                           {"scrolled": True, "scrollY": after, "wheel_used": after != before})
 
@@ -327,30 +424,29 @@ def click(sess, args, session_dir):
     # cdt 增强:非双击且节点 role=option → 原生 select 选值
     if not args.get("dblClick") and (node.get("role") or {}).get("value") == "option":
         if _select_native_option(sess, uid, node):
-            humanize.op_delay()
             return _with_snapshot(sess, args.get("includeSnapshot"), {"clicked": True})
-    cx, cy = _uid_quad(sess, uid)
-    # Input 派发统一走 ws 通道(DP 的弹窗前置检查会拒发 mouseReleased,上游无此阻塞)
-    dispatch = _node_channel(sess, uid)
+    vx, vy = _uid_quad(sess, uid)
+    # Input 派发统一走主 session ws 通道(坐标已换算主视口系,浏览器 hit-test 路由
+    # 进跨域 iframe;DP 的弹窗前置检查会拒发 mouseReleased,上游无此阻塞)
+    dispatch = _input_channel(sess)
     try:
-        humanize.click_xy(sess.t, cx, cy, dbl=bool(args.get("dblClick")), dispatch=dispatch)
+        humanize.click_xy(sess.t, vx, vy, dbl=bool(args.get("dblClick")), dispatch=dispatch)
     except TimeoutError:
         # 点击已发生(alert 等弹窗在按下/抬起间弹出阻塞 renderer,Released 的 ACK 不回)。
         # 对齐上游 dialogHandled 语义:不作工具失败,dialog 交给 AI handle_dialog。
         pass
-    humanize.op_delay()
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
-                          {"clicked": True, "x": round(cx, 1), "y": round(cy, 1),
+                          {"clicked": True, "x": round(vx, 1), "y": round(vy, 1),
                            **({"navigated_to_url": nav} if nav else {})})
 
 
 def hover(sess, args, session_dir):
     _check_dialog(sess)
     uid = str(args["uid"])
-    cx, cy, *_ = _uid_quad(sess, uid)
-    dispatch = _node_channel(sess, uid)
-    humanize.move_mouse(sess.t, cx, cy, dispatch=dispatch)
+    vx, vy = _uid_quad(sess, uid)
+    dispatch = _input_channel(sess)
+    humanize.move_mouse(sess.t, vx, vy, dispatch=dispatch)
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
                           {"done": True, **({"navigated_to_url": nav} if nav else {})})
@@ -361,17 +457,17 @@ def drag(sess, args, session_dir):
     t = sess.t
     from_uid, to_uid = str(args["from_uid"]), str(args["to_uid"])
     frames = getattr(sess, "uid_frames", {})
-    x1, y1, *_ = _uid_quad(sess, from_uid)
-    x2, y2, *_ = _uid_quad(sess, to_uid)
+    x1, y1 = _uid_quad(sess, from_uid)
+    x2, y2 = _uid_quad(sess, to_uid)
     if bool(frames.get(from_uid)) != bool(frames.get(to_uid)):
         raise ValueError("cross-frame drag is not supported: from_uid and to_uid must be in the same frame")
-    dispatch = _node_channel(sess, from_uid) if frames.get(from_uid) else None
-    humanize.move_mouse(t, x1, y1, dispatch=dispatch)
-    send = dispatch or (lambda m, **kw: t.run_cdp(m, **kw))
+    # 坐标已换算主视口系:按下/拖动/抬起统一主 session 派发(浏览器 hit-test 路由)
+    send = _input_channel(sess)
+    humanize.move_mouse(t, x1, y1, dispatch=send)
     send("Input.dispatchMouseEvent", type="mousePressed", x=x1, y=y1, button="left", clickCount=1)
-    for px, py in humanize.bezier_path(x1, y1, x2, y2):
+    for px, py in humanize.trajectory(x1, y1, x2, y2)[1:-1]:
         send("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py, button="left", buttons=1)
-        time.sleep(0.012)
+        time.sleep(humanize._STEP_S)
     send("Input.dispatchMouseEvent", type="mouseReleased", x=x2, y=y2, button="left", clickCount=1)
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
@@ -388,7 +484,7 @@ def fill(sess, args, session_dir):
         raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
     bnn = node.get("backendDOMNodeId")
     sid = getattr(sess, "uid_frames", {}).get(str(uid))
-    dispatch = _node_channel(sess, uid)  # Input 派发统一走 ws(DP 弹窗检查会拒发)
+    dispatch = _input_channel(sess)  # Input 派发统一走主 session ws(DP 弹窗检查会拒发)
     cdp = _session_cdp_safe(sess)
     # 可见 → 强聚焦(不依赖点击命中)→ 拟人点击(真实感)→ 元素级置值
     cdp.call("DOM.scrollIntoViewIfNeeded", timeout=10,
@@ -433,7 +529,6 @@ def fill(sess, args, session_dir):
         raise ValueError(f"Failed to interact with the element with uid {uid}. "
                          f"The element did not become interactive within the configured "
                          f"timeout. ({kind[4:]})")
-    humanize.op_delay()
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
                           {"filled": True, "kind": kind,
@@ -798,49 +893,10 @@ def _iter_frames(t):
 
 # ---- 截图/执行/调试 ----
 
-def _iframe_viewport_origin(sess, host_bnn, host_sid=None):
-    """OOPIF 子视口原点在主视口中的位置:宿主 iframe 元素 border-box 左上 + border + padding。
-    Page.captureScreenshot 是 page 级(主视口系),frame 内 getContentQuads 需此换算。
-    宿主元素可能嵌在 OOPIF(嵌套 iframe)内:按候选 session 解析(已知宿主 session
-    优先,再主 session,再其余子 session)。"""
-    if not host_bnn:
-        return (0.0, 0.0)
-    cdp = _session_cdp_safe(sess)
-    candidates = ([host_sid] if host_sid else []) + [None]
-    if cdp:
-        candidates += [s for s in list(cdp.child_sessions) if s not in candidates]
-    def _chan_for(sid):
-        """候选 session 的调用器(默认参绑定 sid,免闭包迟到陷阱)。"""
-        if cdp:
-            return lambda m, timeout=10, session_id=sid, **kw: cdp.call(
-                m, timeout=timeout, session_id=session_id, **kw)
-        return lambda m, timeout=10, session_id=None, **kw: sess.t.run_cdp(m, **kw)
-
-    for sid in candidates:
-        chan = _chan_for(sid)
-        try:
-            r = chan("DOM.resolveNode", backendNodeId=host_bnn)
-            oid = (r.get("object") or {}).get("objectId")
-            if not oid:
-                continue
-            res = chan("Runtime.callFunctionOn", objectId=oid, returnByValue=True,
-                       functionDeclaration="""function () {
-                         const b = this.getBoundingClientRect();
-                         const cs = getComputedStyle(this);
-                         return {x: b.left + this.clientLeft + parseFloat(cs.paddingLeft || '0'),
-                                 y: b.top + this.clientTop + parseFloat(cs.paddingTop || '0')};
-                       }""")
-            v = (res.get("result") or {}).get("value") or {}
-            return (float(v.get("x", 0)), float(v.get("y", 0)))
-        except Exception:
-            continue
-    return (0.0, 0.0)
-
-
 def take_screenshot(sess, args, session_dir):
     """对齐 cdt:format(png/jpeg/webp)/ quality(jpeg|webp)/ uid(元素截图,
     与 fullPage 互斥)/ fullPage(全页)/ filePath。统一走 Page.captureScreenshot。
-    OOPIF 元素:quads 按 frame session 取(子视口系),经宿主几何换算主视口 clip。"""
+    OOPIF 元素:quads 按 frame session 取(子视口系),经宿主链换算主视口 clip。"""
     t = sess.t
     _check_dialog(sess)
     fmt = args.get("format") or "png"
@@ -856,7 +912,6 @@ def take_screenshot(sess, args, session_dir):
         if not node:
             raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
         bnn = node.get("backendDOMNodeId")
-        frame_sid = getattr(sess, "uid_frames", {}).get(str(uid))
         cdp = _node_channel(sess, str(uid))
         cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=bnn)
         quads = (cdp("DOM.getContentQuads", backendNodeId=bnn) or {}).get("quads") or []
@@ -865,10 +920,9 @@ def take_screenshot(sess, args, session_dir):
         q = quads[0]
         xs, ys = q[0::2], q[1::2]
         ox, oy = (0.0, 0.0)
-        if frame_sid:
-            ox, oy = _iframe_viewport_origin(
-                sess, getattr(sess, "uid_hosts", {}).get(str(uid)),
-                getattr(sess, "uid_host_sids", {}).get(str(uid)))
+        if getattr(sess, "uid_frames", {}).get(str(uid)):
+            ox, oy = _frame_origin_in_main(
+                sess, str(uid), getattr(sess, "uid_frame_ids", {}).get(str(uid)))
         clip = {"x": min(xs) + ox, "y": min(ys) + oy,
                 "width": max(xs) - min(xs), "height": max(ys) - min(ys), "scale": 1}
     elif full:

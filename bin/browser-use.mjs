@@ -191,7 +191,8 @@ usage:
       case "stop": {
         await ensureDaemon();
         const r = await rpc("session.stop", { session_id: need() });
-        return jsonMode ? outJson(r) : out(`state=${r.state} tools=${r.summary.tools} artifacts=${r.summary.artifacts}`);
+        return jsonMode ? outJson(r)
+          : out(r.summary ? `state=${r.state} tools=${r.summary.tools} artifacts=${r.summary.artifacts}` : `state=${r.state} (already cleaned)`);
       }
       case "sessions": {
         await ensureDaemon();

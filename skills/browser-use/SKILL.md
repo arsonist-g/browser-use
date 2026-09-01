@@ -23,7 +23,7 @@ Imperative sentences are rules you must follow. Code blocks are command examples
 
 1. **Start**: `browser-use start` (add `--headless` for background work). It injects login cookies and launches an isolated Edge, then prints `session=<id>`. **Read that id** and pass it on every later command. You cannot choose it. Each session is a separate Edge instance, so concurrent AI windows never share a browser.
 2. **Work**: run tools against the session (see AI workflow).
-3. **Stop**: when done, `browser-use stop --session=<id>`. It closes the Edge, deletes the one-off profile, and writes the session summary. Always stop your sessions; do not leave browsers running behind you.
+3. **Stop**: when done, `browser-use stop --session=<id>`. It closes the Edge and deletes the session's data entirely — the one-off profile, artifacts (screenshots, traces, snapshots), and the session record. Nothing is kept after stop; save anything you need out of the session before stopping. Always stop your sessions; do not leave browsers running behind you.
 
 `browser-use sessions list` shows live sessions; `browser-use sessions clean` reaps orphans. `browser-use status` shows daemon, bridge, and session state.
 
@@ -102,7 +102,7 @@ The **Tool reference** section at the end of this file maps every tool to its pa
 
 ## Tool reference
 
-Every tool command requires `--session=<id>` (the id printed by `start`). Required parameters are passed **positionally**, in the order shown, marked with `*`; optional parameters use `--name value`. Every tool also accepts `--output-format=json` (machine-readable output) and `--timeout <ms>` (call timeout). The tables below list parameter names and command-specific notes only; run `browser-use help <tool>` for the full per-parameter reference at runtime.
+Every tool command requires `--session=<id>` (the id printed by `start`). The signature column shows how each parameter is passed, in order: `<uid>` = required **positional** argument, `[url]` = optional positional, `--flag` = optional flag, `--filePath*` = required flag. Every tool also accepts `--output-format=json` (machine-readable output) and `--timeout <ms>` (call timeout). The tables below list parameter names and command-specific notes only; run `browser-use help <tool>` for the full per-parameter reference at runtime.
 
 ### Shared parameters
 
@@ -140,59 +140,59 @@ Every tool command requires `--session=<id>` (the id printed by `start`). Requir
 
 ### Input automation (11 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `click` | Clicks on the provided element. | `uid*` `--dblClick` `--includeSnapshot` | |
-| `click_at` | Clicks at page coordinates. | `x*` `y*` `--dblClick` | |
-| `drag` | Drags one element onto another. | `from_uid*` `to_uid*` `--includeSnapshot` | |
-| `fill` | Types text into an input, or selects an option. | `uid*` `value*` `--includeSnapshot` | Missing select options are an error, not a silent no-op. |
+| `click` | Clicks on the provided element. | `<uid>` `--dblClick` `--includeSnapshot` | |
+| `click_at` | Clicks at page coordinates. | `<x>` `<y>` `--dblClick` | |
+| `drag` | Drags one element onto another. | `<from_uid>` `<to_uid>` `--includeSnapshot` | |
+| `fill` | Types text into an input, or selects an option. | `<uid>` `<value>` `--includeSnapshot` | Missing select options are an error, not a silent no-op. |
 | `fill_form` | Fills multiple form elements at once. | `--elements*` `--includeSnapshot` | `elements`: JSON array of `{"uid":"1_5","value":"a"}` |
-| `handle_dialog` | Handles a browser dialog. | `action*` `--promptText` | A pending dialog blocks page scripts; no pending dialog errors. |
-| `hover` | Hovers over an element. | `uid*` `--includeSnapshot` | |
-| `press_key` | Presses a key or key combination. | `key*` `--includeSnapshot` | |
+| `handle_dialog` | Handles a browser dialog. | `<action>` `--promptText` | A pending dialog blocks page scripts; no pending dialog errors. |
+| `hover` | Hovers over an element. | `<uid>` `--includeSnapshot` | |
+| `press_key` | Presses a key or key combination. | `<key>` `--includeSnapshot` | |
 | `scroll` | Scrolls the page or a container. | `--direction` `--amount` `--uid` `--includeSnapshot` | Defaults: down 600px. |
-| `type_text` | Types into the focused input. | `text*` `--submitKey` | |
-| `upload_file` | Uploads a file through an element. | `uid*` `filePaths*` `--includeSnapshot` | One absolute path per call. |
+| `type_text` | Types into the focused input. | `<text>` `--submitKey` | |
+| `upload_file` | Uploads a file through an element. | `<uid>` `<filePaths>` `--includeSnapshot` | One absolute path per call. |
 
 ### Navigation automation (6 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `close_page` | Closes a page. | `page_id*` | The last open page cannot be closed. |
+| `close_page` | Closes a page. | `<page_id>` | The last open page cannot be closed. |
 | `list_pages` | Lists open pages. | | |
-| `navigate_page` | Navigates: URL, back, forward, reload. | `url` `--type` `--ignoreCache` `--timeout` `--initScript` `--handleBeforeUnload` | `url` applies only to `--type url` (the default). |
-| `new_page` | Opens a new tab. | `url*` `--background` `--isolatedContext` `--timeout` | Returns the new page id. |
-| `select_page` | Selects the page for future tool calls. | `page_id*` `--bringToFront` | |
-| `wait_for` | Waits for text to appear. | `text*` `--timeout` | Searches the main document and all frames. |
+| `navigate_page` | Navigates: URL, back, forward, reload. | `[url]` `--type` `--ignoreCache` `--timeout` `--initScript` `--handleBeforeUnload` | `url` applies only to `--type url` (the default). |
+| `new_page` | Opens a new tab. | `<url>` `--background` `--isolatedContext` `--timeout` | Returns the new page id. |
+| `select_page` | Selects the page for future tool calls. | `<page_id>` `--bringToFront` | |
+| `wait_for` | Waits for text to appear. | `<text>` `--timeout` | Searches the main document and all frames. |
 
 ### Emulation (2 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
 | `emulate` | Emulates network, CPU, geolocation, headers, color scheme. | `--networkConditions` `--cpuThrottlingRate` `--geolocation` `--extraHttpHeaders` `--colorScheme` | User agent, viewport, platform, and language overrides are unsupported (red line). |
-| `resize_page` | Resizes the window. | `width*` `height*` | |
+| `resize_page` | Resizes the window. | `<width>` `<height>` | |
 
 ### Performance (3 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
 | `performance_start_trace` | Starts a performance trace. | `--reload` `--autoStop` `--filePath` | One trace at a time; defaults: reload true, autoStop true. |
 | `performance_stop_trace` | Stops the trace. | `--filePath` | No-op when not recording. |
-| `performance_analyze_insight` | Explains one Performance Insight. | `insightName*` `insightSetId*` `--filePath` | |
+| `performance_analyze_insight` | Explains one Performance Insight. | `<insightName>` `<insightSetId>` `--filePath` | |
 
 ### Network (2 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `get_network_request` | Gets one request with body. | `reqid*` `--requestFilePath` `--responseFilePath` | Optional file paths save the request/response body to disk instead of returning it inline. |
+| `get_network_request` | Gets one request with body. | `<reqid>` `--requestFilePath` `--responseFilePath` | Optional file paths save the request/response body to disk instead of returning it inline. |
 | `list_network_requests` | Lists network requests. | `--resourceTypes` `--includePreservedRequests` | Returns requests since the previous call. |
 
 ### Debugging (9 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `evaluate_script` | Evaluates a JS function in the page. | `function*` `--args` `--dialogAction` `--filePath` `--waitForStableDom` | Return value must be JSON-serializable; async functions supported. |
-| `get_console_message` | Gets one console message. | `msgid*` | |
+| `evaluate_script` | Evaluates a JS function in the page. | `<function>` `--args` `--dialogAction` `--filePath` `--waitForStableDom` | Return value must be JSON-serializable; async functions supported. |
+| `get_console_message` | Gets one console message. | `<msgid>` | |
 | `lighthouse_audit` | Runs a Lighthouse audit. | `--mode` `--device` `--onlyCategories` `--outputDirPath` | Navigation mode only; the first run pulls the CLI via npx and is slow. |
 | `list_console_messages` | Lists console messages. | `--types` `--includeStackTraces` `--includePreservedMessages` `--pageSize` `--pageIdx` | Returns messages since the previous call; console API calls only, uncaught exceptions are not captured. |
 | `screencast_collect` | Counts captured frames. | | While recording. |
@@ -205,7 +205,7 @@ Every tool command requires `--session=<id>` (the id printed by `start`). Requir
 
 All memory tools address snapshots by their `.heapsnapshot` file path.
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
 | `close_heapsnapshot` | Frees a loaded snapshot. | `--filePath*` | |
 | `compare_heapsnapshots` | Diffs two snapshots. | `--baseFilePath*` `--currentFilePath*` `--classIndex` | |
@@ -223,44 +223,44 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 
 ### Third-party (2 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `execute_3p_developer_tool` | Executes a page-exposed tool. | `toolName*` `--params` | |
+| `execute_3p_developer_tool` | Executes a page-exposed tool. | `<toolName>` `--params` | |
 | `list_3p_developer_tools` | Lists page-exposed tools. | | |
 
 ### WebMCP (2 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `execute_webmcp_tool` | Executes a page-exposed WebMCP tool. | `toolName*` `--input` | Session must start with `--extra-flags '["--enable-features=WebMCP"]'`. |
+| `execute_webmcp_tool` | Executes a page-exposed WebMCP tool. | `<toolName>` `--input` | Session must start with `--extra-flags '["--enable-features=WebMCP"]'`. |
 | `list_webmcp_tools` | Lists page-exposed WebMCP tools. | | Same session requirement. |
 
 ### PWA (4 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `get_os_app_state` | Reads an installed app's manifest state. | `manifestId*` | |
-| `install_pwa` | Installs a PWA as an OS app. | `manifestId*` `installUrlOrBundleUrl*` `--displayMode` | |
-| `launch_pwa` | Launches an installed PWA. | `manifestId*` | |
-| `uninstall_pwa` | Uninstalls a PWA. | `manifestId*` | |
+| `get_os_app_state` | Reads an installed app's manifest state. | `<manifestId>` | |
+| `install_pwa` | Installs a PWA as an OS app. | `<manifestId>` `<installUrlOrBundleUrl>` `--displayMode` | |
+| `launch_pwa` | Launches an installed PWA. | `<manifestId>` | |
+| `uninstall_pwa` | Uninstalls a PWA. | `<manifestId>` | |
 
 ### Extensions (5 tools)
 
-| Tool | Description | Parameters | Notes |
+| Tool | Description | Signature | Notes |
 |---|---|---|---|
-| `install_extension` | Installs an unpacked extension. | `path*` | Session-scoped; the daily browser is untouched. |
+| `install_extension` | Installs an unpacked extension. | `<path>` | Session-scoped; the daily browser is untouched. |
 | `list_extensions` | Lists session extensions. | | |
-| `reload_extension` | Reloads an extension. | `id*` | |
-| `trigger_extension_action` | Triggers the extension's default action. | `id*` | |
-| `uninstall_extension` | Uninstalls an extension. | `id*` | |
+| `reload_extension` | Reloads an extension. | `<id>` | |
+| `trigger_extension_action` | Triggers the extension's default action. | `<id>` | |
+| `uninstall_extension` | Uninstalls an extension. | `<id>` | |
 
 ### Session commands
 
 | Command | Parameters | Notes |
 |---|---|---|
 | `start` | `--headless` `--browser-exe` `--extra-flags` | The only command without `--session`; prints `session=<id>`. |
-| `stop` | `--session=<id>` | Closes the browser and deletes the one-off profile. |
-| `sessions list` / `sessions clean` | `[--state=<s>]` | `clean` reaps orphaned sessions. |
+| `stop` | `--session=<id>` | Closes the browser and deletes the session directory entirely (profile, artifacts, logs). |
+| `sessions list` / `sessions clean` | `[--state=<s>]` | `clean` reaps non-live sessions and deletes their data entirely. |
 | `session.bare` | `--session=<id>` | Skips login-state injection. |
 | `status` | | Daemon, bridge, and session state. |
 | `config get/set/list/reset` | | |

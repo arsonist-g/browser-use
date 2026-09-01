@@ -124,7 +124,6 @@ def click_at(sess, args, session_dir):
         humanize.click_xy(sess.t, x, y, dbl=bool(args.get("dblClick")))
     except TimeoutError:
         pass  # 弹窗在按下/抬起间弹出:点击已发生,dialog 交给 AI(同 click)
-    humanize.op_delay()
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
                           {"clicked": True, "x": x, "y": y,

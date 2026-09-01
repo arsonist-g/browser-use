@@ -3,6 +3,8 @@
 
 GET /            → index.html
 GET /child.html  → 子页
+GET /xo-offset   → 中部大偏移跨域 iframe 宿主页(iframe → 127.0.0.2 /xo-inner,防歪打正着)
+GET /xo-inner    → 中部偏移用例子页(按钮带大内偏移,点击后 inner-clicked)
 GET /xo-host     → 跨域 iframe 宿主页(iframe 指向 127.0.0.2 同端口,site isolation → OOPIF)
 GET /xo-nested   → 嵌套 iframe 宿主页(iframe → 127.0.0.2 /xo-mid)
 GET /xo-mid      → 中层跨站页(同 host 深页 iframe + 127.0.0.3 跨站深页 iframe)
@@ -74,6 +76,31 @@ class Handler(BaseHTTPRequestHandler):
             ms = int(self.path.split("ms=")[-1] or 0)
             time.sleep(ms / 1000.0)
             self._send(200, f"slow done {ms}", cors)
+        elif path == "/xo-inner":
+            # 中部偏移用例的子页:按钮带大内偏移(iframe 内 spacer),使"子 frame 内
+            # 坐标小 + 宿主偏移大"同时成立——换算缺失时落点必在主视口左上角
+            html = """<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>BU Fixture 偏移子页</title></head>
+<body style="margin:0">
+<div style="height:130px;background:#f4f4f4">inner spacer 130px</div>
+<button id="inner-btn" onclick="document.getElementById('inner-log').textContent='inner-clicked'">偏移子页按钮</button>
+<div id="inner-log">(inner 未点击)</div>
+</body>
+</html>"""
+            self._send(200, html, {"Content-Type": "text/html; charset=utf-8", **cors})
+        elif path == "/xo-offset":
+            # 中部大偏移跨域 iframe 宿主页:iframe 前有大块占位,使其远离视口原点——
+            # 防"顶部 iframe 偏移小、坐标错误歪打正着"的退化;iframe 内按钮可点击
+            html = f"""<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>BU Fixture 中部偏移 iframe</title></head>
+<body style="margin:0">
+<div style="height:420px;background:#eee">spacer 420px — iframe 必须远离视口原点</div>
+<iframe id="xo" src="http://127.0.0.2:{BIND_PORT}/xo-inner" style="width:460px;height:260px;border:2px solid #888;margin-left:37px"></iframe>
+</body>
+</html>"""
+            self._send(200, html, {"Content-Type": "text/html; charset=utf-8", **cors})
         elif path == "/xo-host":
             # 动态注入端口(与第二个 127.0.0.2 实例同端口);不同 host = 跨站 → OOPIF
             html = f"""<!doctype html>

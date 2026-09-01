@@ -1,76 +1,141 @@
 # -*- coding: utf-8 -*-
-"""拟人操作层(Must;基准:camoufox humanize/Cursor Movement,M1 简化移植)。
-
-- 鼠标:三次贝塞尔曲线点列 + 逐点 Input.dispatchMouseEvent(mouseMoved),步进 8~16ms
-- 打字:逐字符 dispatchKeyEvent(rawKeyDown/char/keyUp),间隔高斯 55~165ms
-- 点击按下/抬起间隔 60~130ms;操作间随机延迟窗 120~420ms
-全部走 CDP Input 域合成事件(isTrusted=true),不启用 Runtime.enable(CONSTRAINT-001)。
+"""拟人操作层。鼠标轨迹按 camoufox 源码移植(用户点名基线,取代自造 bezier):
+- 轨迹算法 = daijro/camoufox additions/camoucfg/MouseTrajectories.hpp 的
+  HumanizeMouseTrajectory(HumanCursor 曲线的 camoufox 修改版:连续均匀内部控制点、
+  取整的 y 扰动、距离自适应点数、easeOutQuad 索引重采样),Python 直译;
+- 派发节奏 = additions/juggler/protocol/PageHandler.js humanize 分支:只有 move 被
+  人类化,按下/抬起直接派发;中间点固定 10ms 间隔、跳过首尾点对、视口外点过滤
+  (边界用 >= 判界)、终点精确派发、零位移短路;
+- 全部走 CDP Input 域合成事件(isTrusted=true),不启用 Runtime.enable(CONSTRAINT-001)。
+偏离声明:camoufox 无 press 间隔随机化(juggler 的 renderer 回执链自带自然延迟);
+CDP 合成派发无回执,按下→抬起间保留小随机间隔补偿该差距。点数上限取
+humanize:maxTime 机制的收紧值(camoufox 默认 150 点≈1.5s,为盾类时序敏感场景压低)。
 """
 import math
 import random
+import time
+
+# ---- MouseTrajectories.hpp 常量(逐项对应,勿改值——改值即偏离基线) ----
+_KNOT_MARGIN = 80      # generateCurve:控制点采样区 = 起终点包围盒外扩 px
+_KNOT_COUNT = 2        # generateCurve:内部控制点数(4 点 = 三次贝塞尔)
+_DISTORT_MEAN = 1.0    # distortPoints:y 扰动正态均值 px
+_DISTORT_STD = 1.0     # distortPoints:y 扰动正态标准差
+_DISTORT_FREQ = 0.5    # distortPoints:中间点被扰动概率
+_LEN_EXP = 0.25        # tweenPoints:弧长→点数的幂标度(保持速度一致)
+_LEN_FACTOR = 20       # tweenPoints:点数乘子
+_MAX_POINTS = 30       # getMaxTime:点数上限(camoufox 默认 150;humanize:maxTime 收紧值)
+_MIN_POINTS = 2        # getMinTime:0(默认)→ 下限 0+2
+_STEP_S = 0.010        # PageHandler.js:每中间点固定 10ms(无随机)
+
+# 按下→抬起间隔(见模块头偏离声明)
+_PRESS_S = (0.02, 0.06)
 
 
-def _gauss(lo, hi):
-    mid = (lo + hi) / 2
-    return max(lo, min(hi, random.gauss(mid, (hi - lo) / 6)))
+def _ease_out_quad(t):
+    """hpp easeOutQuad:-t(t-2),只减速不加速的缓出。"""
+    return -t * (t - 2)
 
 
-def bezier_path(x0, y0, x1, y1, steps=None):
-    """带轻微弧度的鼠标轨迹(控制点随机偏移),端点准、中段抖。"""
-    if steps is None:
-        dist = math.hypot(x1 - x0, y1 - y0)
-        steps = max(8, min(48, int(dist / 18)))
-    # 控制点:垂直于连线方向随机偏移
-    mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-    dx, dy = x1 - x0, y1 - y0
-    norm = math.hypot(dx, dy) or 1
-    off = random.uniform(-dist * 0.12, dist * 0.12) if (dist := math.hypot(dx, dy)) else 0
-    cx, cy = mx - dy / norm * off, my + dx / norm * off
-    pts = []
-    for i in range(1, steps + 1):
-        t = i / steps
-        # 二次贝塞尔 + 微抖
-        x = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
-        y = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
-        pts.append((x + random.uniform(-0.6, 0.6), y + random.uniform(-0.6, 0.6)))
-    return pts
+def trajectory(x0, y0, x1, y1):
+    """HumanizeMouseTrajectory.getPoints 直译:返回含首尾的整数点列。
+    流程 = 三次贝塞尔采样(长边每 px 一点)→ y 向扰动 → 弧长幂标度定步数 →
+    easeOutQuad 索引重采样(末段步距收敛)。"""
+    left = min(x0, x1) - _KNOT_MARGIN
+    right = max(x0, x1) + _KNOT_MARGIN
+    down = min(y0, y1) - _KNOT_MARGIN
+    up = max(y0, y1) + _KNOT_MARGIN
+    knots = [(random.uniform(left, right), random.uniform(down, up))
+             for _ in range(_KNOT_COUNT)]
+    p0, p3 = (x0, y0), (x1, y1)
+    p1, p2 = knots
+
+    n = int(max(abs(x1 - x0), abs(y1 - y0), 2))  # generatePoints.midPtsCnt
+    raw = []
+    for i in range(n):
+        t = i / (n - 1) if n > 1 else 0.0
+        u = 1.0 - t
+        raw.append((u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+                    u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1]))
+
+    distorted = [raw[0]]  # distortPoints:首尾强制不动
+    for pt in raw[1:-1]:
+        dy = round(random.gauss(_DISTORT_MEAN, _DISTORT_STD)) \
+            if random.random() < _DISTORT_FREQ else 0.0
+        distorted.append((pt[0], pt[1] + dy))
+    distorted.append(raw[-1])
+
+    total = 0.0  # tweenPoints:折线总弧长
+    for a, b in zip(distorted, distorted[1:], strict=False):
+        total += math.hypot(b[0] - a[0], b[1] - a[1])
+    target = min(_MAX_POINTS, max(_MIN_POINTS, int(total ** _LEN_EXP * _LEN_FACTOR)))
+    out = []
+    for i in range(target):
+        t = i / (target - 1)
+        idx = int(_ease_out_quad(t) * (len(distorted) - 1))
+        out.append((round(distorted[idx][0]), round(distorted[idx][1])))
+    return out
 
 
 def move_mouse(tab, x, y, dispatch=None):
-    """从当前(last)位置拟人移动到 (x, y)。M1 以 (0,0) 起点可接受——后续保存上一坐标。
-    dispatch:Input 域发送通道,默认 tab.run_cdp;OOPIF 元素传其子 session 调用器
-    (坐标系为该 frame 自身视口,与 DOM.getContentQuads 一致)。"""
+    """从上次落点拟人移动到 (x, y)(PageHandler mousemove 分支语义):
+    轨迹起点 = 上次真实落点(初始 (0,0),camoufox _lastTrackedPos 同款);零位移
+    短路;中间点逐个派发 + 固定 10ms,视口外(含恰在边界)的点跳过;终点精确
+    派发。dispatch:Input 派发通道(主 session ws;坐标已换算主视口系)。"""
     send = dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
-    last = getattr(tab, "_bu_last_mouse", (x, y))
-    for px, py in bezier_path(last[0], last[1], x, y):
-        send("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py)
-        import time
-        time.sleep(random.uniform(0.008, 0.016))
+    last = getattr(tab, "_bu_last_mouse", (0.0, 0.0))
+    if round(x) == round(last[0]) and round(y) == round(last[1]):
+        tab._bu_last_mouse = (x, y)
+        return
+    vw, vh = _viewport(send)
+    for px, py in trajectory(last[0], last[1], x, y)[1:-1]:  # 跳过起点对与终点对
+        if 0 <= px < vw and 0 <= py < vh:
+            send("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py)
+            time.sleep(_STEP_S)
+    send("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
     tab._bu_last_mouse = (x, y)
 
 
+def _viewport(send):
+    """视口尺寸(中间点边界过滤用;PageHandler 用 browser 元素矩形,CDP 侧为
+    layout viewport)。查询失败返回大值(不过滤——出界中间点在 CDP 下无害)。"""
+    try:
+        r = send("Runtime.evaluate", expression="[innerWidth, innerHeight]",
+                 returnByValue=True)
+        v = (r.get("result") or {}).get("value")
+        if isinstance(v, list) and len(v) == 2 and v[0] > 0:
+            return (v[0], v[1])
+    except Exception:
+        pass
+    return (10 ** 6, 10 ** 6)
+
+
 def click_xy(tab, x, y, dbl=False, dispatch=None):
-    import time
+    """move → 按下 → 抬起(camoufox:点击不经轨迹展开,move 段已人类化)。
+    按下/抬起间的小随机间隔见模块头偏离声明。"""
     send = dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
     move_mouse(tab, x, y, dispatch)
-    time.sleep(_gauss(0.06, 0.13))
     common = dict(x=x, y=y, button="left", clickCount=1)
     send("Input.dispatchMouseEvent", type="mousePressed", **common)
-    time.sleep(_gauss(0.06, 0.13))
+    time.sleep(random.uniform(*_PRESS_S))
     send("Input.dispatchMouseEvent", type="mouseReleased", **common)
     if dbl:
         send("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=2)
+        time.sleep(random.uniform(*_PRESS_S))
         send("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=2)
 
 
 def type_text(tab, text, submit_key=None):
-    import time
     for ch in text:
         tab.run_cdp("Input.dispatchKeyEvent", type="keyDown", text=ch, unmodifiedText=ch)
         tab.run_cdp("Input.dispatchKeyEvent", type="keyUp", text=ch, unmodifiedText=ch)
         time.sleep(_gauss(0.055, 0.165))
     if submit_key:
         press_key(tab, submit_key)
+
+
+def _gauss(lo, hi):
+    mid = (lo + hi) / 2
+    return max(lo, min(hi, random.gauss(mid, (hi - lo) / 6)))
 
 
 _KEY_MODIFIERS = {"Control", "Alt", "Shift", "Meta"}
@@ -149,7 +214,6 @@ def press_key(tab, key):
     """Enter/Control+A 形式;修饰键按住→主键→释放。可打印字符走 keyDown(text)
     使其产生实际输入(对齐 puppeteer press 语义,rawKeyDown 不生成字符)。
     中途抛错时 finally 逆序释放已按下的修饰键(上游 #2309),避免修饰键逻辑卡死。"""
-    import time
     main, *mods = parse_key(key)
     modifiers = 0
     pressed = []
@@ -176,9 +240,3 @@ def press_key(tab, key):
         for m, mods_bit in reversed(pressed):
             tab.run_cdp("Input.dispatchKeyEvent", type="keyUp",
                         key=m, code=f"{m}Left", modifiers=mods_bit)
-
-
-def op_delay():
-    """操作间随机延迟窗。"""
-    import time
-    time.sleep(_gauss(0.12, 0.42))

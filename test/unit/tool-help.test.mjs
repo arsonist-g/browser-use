@@ -64,7 +64,8 @@ test("SKILL.md 工具表与 TOOL_REFERENCE 参数集合/位置/必填标记同�
   const md = fs.readFileSync(path.join(ROOT, "skills", "browser-use", "SKILL.md"), "utf8");
   let section = md.slice(md.indexOf("## Tool reference"));
   section = section.slice(0, section.indexOf("### Session commands")); // 会话命令表不属 TOOL_REFERENCE
-  // 解析工具表行:4 列 | `tool` | desc | params | notes |(Shared parameters 表只有 3 段,自动排除)
+  // 解析工具表行:4 列 | `tool` | desc | signature | notes |(Shared parameters 表只有 3 段,自动排除)
+  // signature 形态:<uid> = 必填位置,[url] = 可选位置,--flag = 可选 flag,--filePath* = 必填 flag
   const seen = new Map(); // tool -> [{name, pos, req}]
   for (const line of section.split("\n")) {
     if (!line.startsWith("| `")) continue;
@@ -74,8 +75,15 @@ test("SKILL.md 工具表与 TOOL_REFERENCE 参数集合/位置/必填标记同�
     if (!/^\w+$/.test(tool)) continue;
     const params = [...cells[3].matchAll(/`([^`]+)`/g)].map((p) => p[1])
       .filter((p) => p !== "--session=<id>")
-      .map((p) => ({ raw: p, name: p.replace(/^--/, "").replace(/\*$/, ""),
-        pos: !p.startsWith("--"), req: p.endsWith("*") }));
+      .map((p) => {
+        const isFlag = p.startsWith("--");
+        return {
+          raw: p,
+          name: isFlag ? p.slice(2).replace(/\*$/, "") : p.replaceAll(/[<>\[\]]/g, ""),
+          pos: !isFlag,
+          req: isFlag ? p.endsWith("*") : p.startsWith("<"),
+        };
+      });
     seen.set(tool, params);
   }
   assert.equal(seen.size, 59, `工具表应有 59 行,实际 ${seen.size}`);
@@ -87,9 +95,13 @@ test("SKILL.md 工具表与 TOOL_REFERENCE 参数集合/位置/必填标记同�
     assert.deepEqual(tableNames, refNames, `${tool} 参数集合不一致`);
     for (const p of params) {
       const a = ref.args.find((x) => x.name === p.name);
-      assert.equal(p.pos, !!a.pos, `${tool}.${p.name} 位置标记不一致(表格 ${p.pos})`);
-      assert.equal(p.req, !!a.req, `${tool}.${p.name} 必填标记不一致(表格 ${p.req})`);
+      assert.equal(p.pos, !!a.pos, `${tool}.${p.name} 位置标记不一致(表格 ${p.raw})`);
+      assert.equal(p.req, !!a.req, `${tool}.${p.name} 必填标记不一致(表格 ${p.raw})`);
     }
+    // 位置参数必须按位置顺序出现(必填在前可选在后不强制,但相对顺序要与 usage 一致)
+    const refPos = ref.args.filter((a) => a.pos).map((a) => a.name);
+    const tablePos = params.filter((p) => p.pos).map((p) => p.name);
+    assert.deepEqual(tablePos, refPos, `${tool} 位置参数顺序不一致(表格 ${tablePos} / 参考 ${refPos})`);
   }
 });
 

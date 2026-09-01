@@ -25,7 +25,7 @@ description: 通过 browser-use CLI 自动化需要登录态或受反爬检测�
 
 1. **启动**:`browser-use start`(后台工作加 `--headless`)。它注入登录 cookie 并启动一个隔离的 Edge,然后打印 `session=<id>`。**记住这个 id**,之后每条命令都带上。你不能自选 id。每个会话是独立的 Edge 实例,并发的 AI 窗口永不共享浏览器。
 2. **工作**:对会话执行工具调用(见 AI workflow)。
-3. **停止**:任务完成时 `browser-use stop --session=<id>`。它关闭 Edge、删除一次性 profile、写出会话摘要。必须停止你的会话;不要留下后台浏览器。
+3. **停止**:任务完成时 `browser-use stop --session=<id>`。它关闭 Edge 并完整删除该会话的数据——一次性 profile、artifacts(截图/trace/快照)与会话记录,一律不留;需要在会话外保留的内容先取走。必须停止你的会话;不要留下后台浏览器。
 
 `browser-use sessions list` 列出存活会话;`browser-use sessions clean` 回收孤儿。`browser-use status` 显示 daemon、桥与会话状态。
 
@@ -261,7 +261,7 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 | Command | Parameters | Notes |
 |---|---|---|
 | `start` | `--headless` `--browser-exe` `--extra-flags` | The only command without `--session`; prints `session=<id>`. |
-| `stop` | `--session=<id>` | Closes the browser and deletes the one-off profile. |
+| `stop` | `--session=<id>` | Closes the browser and deletes the session directory entirely (profile, artifacts, logs). |
 | `sessions list` / `sessions clean` | `[--state=<s>]` | `clean` reaps orphaned sessions. |
 | `session.bare` | `--session=<id>` | Skips login-state injection. |
 | `status` | | Daemon, bridge, and session state. |

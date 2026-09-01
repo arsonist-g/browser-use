@@ -5,6 +5,7 @@
 // 退出码: 0 = 全过;1 = 有 fail(fail 明细列在汇总)
 import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
+import os from "node:os";
 import url from "node:url";
 import fs from "node:fs";
 
@@ -262,10 +263,37 @@ async function main() {
        "OOPIF 孙 uid 点击未路由到其 session");
   }
 
-  // ---- 12. stop ----
+  // ---- 11.5 中部大偏移跨域 iframe(坐标换算防退化) ----
+  // iframe 宿主偏移 ~440px + 内部按钮偏移 ~150px:换算缺失时落点必落主视口左上角空白
+  console.log("\n[11.5] 中部偏移 iframe 落点");
+  bu(["navigate_page", "--session", sessionId, `${BASE}/xo-offset`]);
+  await new Promise(r => setTimeout(r, 2000));
+  snap = bu(["take_snapshot", "--session", sessionId]);
+  ok("偏移 iframe 内容进快照(偏移子页按钮)", snap.includes("偏移子页按钮"),
+     "OOPIF 拼树未生效");
+  const offUid = parseSnapUid(snap, "偏移子页按钮");
+  ok("偏移 iframe 内按钮取得 uid", !!offUid);
+  if (offUid) {
+    bu(["click", "--session", sessionId, offUid]);
+    snap = bu(["take_snapshot", "--session", sessionId]);
+    ok("中部偏移 iframe 点击命中(inner-clicked)", snap.includes("inner-clicked"),
+       "宿主偏移换算缺失——点击落点仍在主视口左上角");
+    const offUid2 = parseSnapUid(snap, "偏移子页按钮");
+    try { bu(["take_screenshot", "--session", sessionId, "--uid", offUid2]); ok("中部偏移 iframe 元素截图(clip 宿主链换算)", true); }
+    catch (e) { ok("中部偏移 iframe 元素截图(clip 宿主链换算)", false, e.message.slice(0, 120)); }
+  }
+
+  // ---- 12. stop(完整删除口径:session 目录 + profile 一律不留) ----
   console.log("\n[12] 收尾");
   out = bu(["stop", "--session", sessionId]);
   ok("stop → cleaned", out.includes("state=cleaned"), out.slice(0, 120));
+  const buHome = process.env.BROWSER_USE_HOME ?? path.join(os.homedir(), ".browser-use");
+  ok("stop 后 session 目录已删", !fs.existsSync(path.join(buHome, "sessions", sessionId)),
+     "会话产物清理不完整——sessions/<id> 仍存在");
+  ok("stop 后 profile 目录已删", !fs.existsSync(path.join(buHome, "profiles", sessionId)),
+     "profile 仍存在");
+  const listed = bu(["sessions", "list", "--output-format=json"]);
+  ok("session list 不含已 stop 会话", !listed.includes(sessionId));
 }
 
 try {
