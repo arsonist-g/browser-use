@@ -8,13 +8,12 @@
 import argparse
 import json
 import os
-import sys
 import time
 import traceback
 
-from .protocol import read_envelope, write_envelope, result, error, elog
-from .session import BrowserSession
 from . import tools as T
+from .protocol import elog, error, read_envelope, result
+from .session import BrowserSession
 
 
 def main():

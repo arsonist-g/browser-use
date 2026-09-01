@@ -9,11 +9,6 @@ import base64
 import json
 import os
 import time
-import urllib.error
-import urllib.request
-
-from .cdp_events import CdpEvents
-
 
 # ---- pipe 通道(daemon 托管浏览器进程的 pipe CDP;PWA/extensions 专用) ----
 
@@ -29,7 +24,7 @@ def _drain_cast_frames(sess):
     """收割 screencast 帧落盘并回 ack;返回本次收割帧数。"""
     n = 0
     sess._cdp.pump()
-    for m, p in sess._cdp.drain_events("Page.screencastFrame"):
+    for _m, p in sess._cdp.drain_events("Page.screencastFrame"):
         data = p.get("data", "")
         if data:
             sess._cast_frames += 1
@@ -224,7 +219,7 @@ def _3p_discover(sess):
     except Exception:
         t.run_cdp("DOM.enable")  # 部分版本需先 enable DOM 域
         listeners = t.run_cdp("DOMDebugger.getEventListeners", objectId=oid).get("listeners", [])
-    if not any(l.get("type") == "devtoolstooldiscovery" for l in listeners):
+    if not any(ln.get("type") == "devtoolstooldiscovery" for ln in listeners):
         return []
     r = t.run_cdp("Runtime.evaluate", expression=_3P_DISCOVERY_EXPR,
                   returnByValue=True, awaitPromise=True)
@@ -295,11 +290,11 @@ def list_webmcp_tools(sess, args, session_dir):
     deadline = time.time() + 3
     while time.time() < deadline and not tools:
         cdp.pump()
-        for m, p in cdp.drain_events("WebMCP.toolsAdded"):
+        for _m, p in cdp.drain_events("WebMCP.toolsAdded"):
             for t in p.get("tools", []):
                 tools[t.get("name")] = t
         time.sleep(0.05)
-    for m, p in cdp.drain_events("WebMCP.toolsRemoved"):
+    for _m, p in cdp.drain_events("WebMCP.toolsRemoved"):
         for t in p.get("tools", []):
             tools.pop(t.get("name"), None)
     return {"tools": [{"name": t.get("name"), "description": t.get("description"),
@@ -329,7 +324,7 @@ def execute_webmcp_tool(sess, args, session_dir):
     deadline = time.time() + 15
     while time.time() < deadline:
         cdp.pump()
-        for m, p in cdp.drain_events("WebMCP.toolResponded"):
+        for _m, p in cdp.drain_events("WebMCP.toolResponded"):
             if p.get("invocationId") == inv:
                 return {"status": p.get("status"), "output": p.get("output"),
                         "errorText": p.get("errorText")}
@@ -437,6 +432,8 @@ def lighthouse_audit(sess, args, session_dir):
     """参数面对齐 cdt(mode/device/outputDirPath + 私有扩展 onlyCategories)。
     类别默认含 agentic-browsing(cdt 同)。mode=snapshot 需编程式 API,
     CLI attach 模式不支持(明确报错,已知限制)。"""
+    from .tools import _check_dialog  # 局部导入:tools.py 底部反向挂载本模块,顶层导入会循环
+    _check_dialog(sess)  # 上游 lighthouse blockedByDialog=true
     import subprocess
     mode = args.get("mode") or "navigation"
     device = args.get("device") or "desktop"

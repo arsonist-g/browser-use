@@ -8,7 +8,8 @@ import fs from "node:fs";
 import url from "node:url";
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
-const VERSION = "0.1.0";
+// 版本号单一来源 = package.json(此前硬编码曾连续两版未同步)
+const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
 
 // ---- 工具位置参数表(P0;M2/M3 占位工具原样转发 flags) ----
 const TOOL_POS = {
@@ -286,8 +287,9 @@ usage:
           args[k.replace(/-/g, "_")] = typed;   // kebab → snake(--snapshot-id → snapshot_id)
         }
         const r = await rpc("tool.call", { session_id: sid, tool: command, args,
-          // --timeout 双语义:rpc 层总超时 + 工具级参数(wait_for/navigate_page 的 core 契约,毫秒)
-          timeout_ms: values.timeout ? Number(values.timeout) : undefined });
+          // --timeout 双语义:rpc 层总超时 + 工具级参数(navigate_page/wait_for 等,毫秒)。
+          // rpc 侧加 5s 余量:工具级超时须先于传输层杀死调用,才能带回自己的错误语义
+          timeout_ms: values.timeout ? Number(values.timeout) + 5000 : undefined });
         if (jsonMode) return outJson(r);
         return out(fmtResult(command, r));
       }

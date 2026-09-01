@@ -4,3 +4,21 @@ version = "0.1.0"
 description = "Browser-Use per-session DrissionPage core (stdio NDJSON protocol)"
 requires-python = ">=3.10"
 dependencies = ["DrissionPage>=4.1.1.4,<4.2"]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.16"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/F/W 基础正确性 + I 导入排序;B bugprone(防重复定义/可变默认参等上轮踩过的坑)
+select = ["E4", "E7", "E9", "F", "W", "I", "B"]
+ignore = [
+  "E501",  # 行长交由 formatter/审阅,不强制
+]
+
+[tool.ruff.lint.per-file-ignores]
+# tools.py 底部反向挂载 performance/memory/advanced(E402 模块级导入不在顶部)
+"tools.py" = ["E402"]

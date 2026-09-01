@@ -186,15 +186,25 @@ def ensure_session_cdp(sess):
 def ensure_oopif_attach(sess):
     """page 级 flatten auto-attach OOPIF(跨域 iframe),返回 CdpEvents 单例。
     每次重设 setAutoAttach(ws 重连后 auto-attach 状态与 child_sessions 一并丢失,
-    重设会对现存 OOPIF 重发 attachedToTarget)并 pump 收集增量;失败抛异常由调用方降级。"""
+    重设会对现存 OOPIF 重发 attachedToTarget)并 pump 收集增量;失败抛异常由调用方降级。
+    递归武装:每个新登记的子 session 也设 setAutoAttach——OOPIF 内再嵌跨站孙 frame
+    (宿主也是 OOPIF)只有宿主 session 武装后才会继续 attach(puppeteer 同款)。"""
     cdp = ensure_session_cdp(sess)
     cdp.call("Target.setAutoAttach", autoAttach=True, waitForDebuggerOnStart=False,
              flatten=True, timeout=10)
-    last = -1
-    deadline = time.time() + 0.6
+    seen = set()
+    deadline = time.time() + 2.0
     while time.time() < deadline:
         cdp.pump()
-        if cdp.child_sessions and len(cdp.child_sessions) == last:
-            break  # 无新登记即视为收齐
-        last = len(cdp.child_sessions)
+        new = [s for s in cdp.child_sessions if s not in seen]
+        if not new:
+            break
+        for s in new:
+            seen.add(s)
+            try:
+                cdp.call("Target.setAutoAttach", autoAttach=True, waitForDebuggerOnStart=False,
+                         flatten=True, timeout=10, session_id=s)
+            except Exception:
+                pass
+            cdp.pump()
     return cdp

@@ -1,0 +1,10 @@
+<!doctype html>
+<!-- iframe 内长文档(同 host = 同进程子 frame):底部按钮验证 frame 内滚动可达 -->
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>BU Fixture iframe 内长页</title></head>
+<body style="margin:8px">
+<div style="height:1600px">长内容占位</div>
+<button id="tall-btn" onclick="document.getElementById('tall-log').textContent='tall-clicked'">深滚按钮</button>
+<div id="tall-log">(tall 未点击)</div>
+</body>
+</html>

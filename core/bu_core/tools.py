@@ -5,12 +5,13 @@
 import base64
 import json
 import os
+import re
 import time
 
 from . import humanize
 from .cdp_events import ensure_session_cdp
 from .session import install_console_hook
-from .snapshot import build_snapshot, scrollability
+from .snapshot import build_snapshot
 
 
 def _live_url(sess):
@@ -223,6 +224,36 @@ def scroll(sess, args, session_dir):
     direction = args.get("direction", "down")
     amount = int(args.get("amount") or 600)
     uid = args.get("uid")
+    frame_sid = getattr(sess, "uid_frames", {}).get(str(uid)) if uid else None
+    frame_fid = getattr(sess, "uid_frame_ids", {}).get(str(uid)) if uid else None
+
+    def _eval_in_frame(expr, tm=6):
+        """在 uid 所属 frame 的 window 上求值:子 frame 经 Page.createIsolatedWorld
+        (隔离世界与主世界共享 DOM,window 即该 frame 的 window,免 Runtime.enable);
+        OOPIF 根 frame 走所属 session 直取;主文档直接求值。失败返回 None。"""
+        cdp = _session_cdp_safe(sess)
+        if cdp and frame_fid:
+            try:
+                w = cdp.call("Page.createIsolatedWorld", timeout=10,
+                             session_id=frame_sid, frameId=frame_fid)
+                cid = (w or {}).get("executionContextId")
+                if cid is not None:
+                    r = cdp.call("Runtime.evaluate", timeout=tm, session_id=frame_sid,
+                                 contextId=cid, expression=expr, returnByValue=True)
+                    return (r.get("result") or {}).get("value")
+            except Exception:
+                return None
+        if frame_sid:
+            try:
+                return _cdp_eval(ensure_session_cdp(sess), expr, timeout=tm,
+                                 session_id=frame_sid)
+            except Exception:
+                return None
+        try:
+            return t.run_js(f"return {expr}")
+        except Exception:
+            return None
+
     if uid:
         cx, cy = _uid_quad(sess, uid)
         dispatch = _node_channel(sess, uid)
@@ -235,32 +266,20 @@ def scroll(sess, args, session_dir):
         humanize.move_mouse(t, cx, cy)
     dx = amount if direction == "right" else -amount if direction == "left" else 0
     dy = amount if direction == "down" else -amount if direction == "up" else 0
-    frame_sid = getattr(sess, "uid_frames", {}).get(str(uid)) if uid else None
 
-    def _scroll_y():
-        if frame_sid:
-            r = ensure_session_cdp(sess).call("Runtime.evaluate", session_id=frame_sid,
-                                              expression="window.scrollY", returnByValue=True)
-            return (r.get("result") or {}).get("value") or 0
-        return t.run_js("return scrollY") or 0
-
-    before = _scroll_y()
+    before = _eval_in_frame("window.scrollY") or 0
     if dispatch:
         dispatch("Input.dispatchMouseEvent", type="mouseWheel", x=cx, y=cy, deltaX=dx, deltaY=dy)
     else:
         t.run_cdp("Input.dispatchMouseEvent", type="mouseWheel", x=cx, y=cy,
                   deltaX=dx, deltaY=dy)
     time.sleep(0.3)
-    after = _scroll_y()
+    after = _eval_in_frame("window.scrollY") or 0
     if after == before and dy:
-        # 滚轮未生效(无命中/合成限制)→ JS 兜底(OOPIF 时在该 frame 内兜底)
-        if frame_sid:
-            ensure_session_cdp(sess).call("Runtime.evaluate", session_id=frame_sid,
-                                          expression=f"window.scrollBy(0, {dy})", returnByValue=True)
-        else:
-            t.run_js(f"window.scrollBy(0, {dy})")
+        # 滚轮未生效(无命中/合成限制)→ JS 兜底 scrollBy(按该 uid 所属 frame)
+        _eval_in_frame(f"window.scrollBy(0, {dy})")
         time.sleep(0.2)
-        after = _scroll_y()
+        after = _eval_in_frame("window.scrollY") or 0
     humanize.op_delay()
     return _with_snapshot(sess, args.get("includeSnapshot"),
                           {"scrolled": True, "scrollY": after, "wheel_used": after != before})
@@ -409,7 +428,11 @@ def fill(sess, args, session_dir):
     res = _resolve_and_call()
     kind = (res.get("result") or {}).get("value")
     if isinstance(kind, str) and kind.startswith("ERR:"):
-        raise ValueError(kind[4:])
+        # 错误层级对齐 cdt handleActionError:主信息 = 交互失败包装行(uid 级),
+        # 具体原因附后(上游原因仅入日志;CLI 单通道场景内联保留可诊断性)
+        raise ValueError(f"Failed to interact with the element with uid {uid}. "
+                         f"The element did not become interactive within the configured "
+                         f"timeout. ({kind[4:]})")
     humanize.op_delay()
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
@@ -464,7 +487,6 @@ def upload_file(sess, args, session_dir):
         pass  # 元素非 file input → 走 file chooser 兜底(cdt 同;仅主 frame)
     if getattr(sess, "uid_frames", {}).get(str(uid)):
         raise ValueError("Failed to upload file: the element is not a file input (cross-frame chooser fallback is not supported)")
-    from .cdp_events import CdpEvents
     if getattr(sess, "_cdp", None) is None:
         from .cdp_events import ensure_session_cdp
         ensure_session_cdp(sess)
@@ -478,7 +500,7 @@ def upload_file(sess, args, session_dir):
         chooser_bnn = None
         while time.time() < deadline and chooser_bnn is None:
             cdp_ev.pump()
-            for m, p in cdp_ev.drain_events("Page.fileChooserOpened"):
+            for _m, p in cdp_ev.drain_events("Page.fileChooserOpened"):
                 chooser_bnn = p.get("backendNodeId")
                 break
             time.sleep(0.05)
@@ -497,22 +519,32 @@ def upload_file(sess, args, session_dir):
 
 
 def handle_dialog(sess, args, session_dir):
-    """对齐 cdt:处理当前挂起的 JS 弹窗;无弹窗时立即报错(不等待)。
-    直调 Page.handleJavaScriptDialog:无弹窗时 CDP 返回 "No dialog is showing",
-    不依赖 DP 事件状态(javascriptDialogOpening 与命令响应存在到达竞态)。"""
+    """对齐 cdt getDialog() 语义:事件状态无弹窗 → "No open dialog found";状态有弹窗
+    但 CDP 报无弹窗(已被外部处理/closed 事件滞后)→ 报成功(上游 accept 失败仅 log)。
+    动作直调 Page.handleJavaScriptDialog,不依赖 DP 事件状态(DEC-015)。"""
     action = args.get("action", "accept")
     prompt = args.get("promptText")
+    cdp = _session_cdp_safe(sess)
     kwargs = {"accept": action == "accept"}
     if prompt is not None:
         kwargs["promptText"] = prompt
+    if cdp:
+        cdp.pump()
+        if not cdp.dialog_state:
+            raise ValueError("No open dialog found")  # 文案对齐 cdt(事件状态无弹窗)
     try:
-        sess.t.run_cdp("Page.handleJavaScriptDialog", **kwargs)
+        if cdp:
+            cdp.call("Page.handleJavaScriptDialog", timeout=10, **kwargs)
+        else:
+            sess.t.run_cdp("Page.handleJavaScriptDialog", **kwargs)
     except Exception as e:
-        if "No dialog" in str(e):
+        if cdp and cdp.dialog_state and "No dialog" in str(e):
+            pass  # 状态有但实际已消失(外部处理):对齐 cdt 仅 log 并报成功
+        elif "No dialog" in str(e):
             raise ValueError("No open dialog found") from None
-        raise
+        else:
+            raise
     # 命令成功 = 弹窗已关闭;ws 的 closed 事件可能滞后,主动清预检状态
-    cdp = getattr(sess, "_cdp", None)
     if cdp:
         cdp.dialog_state = None
     return {"handled": True}
@@ -570,6 +602,18 @@ def _wait_dom_settle(sess, rounds=3, interval=0.2):
         time.sleep(interval)
 
 
+def _nav_reason(e, timeout_s=None, url=None):
+    """失败原因对齐上游 error.message 形态:超时 → "Navigation timeout of N ms exceeded";
+    网络错误 → 取 CDP errorText(net::ERR_*),附 " at <url>"(puppeteer 同款)。"""
+    if isinstance(e, TimeoutError):
+        ms = int(timeout_s * 1000) if timeout_s else 30000
+        return f"Navigation timeout of {ms} ms exceeded"
+    m = re.search(r"net::ERR_[A-Z0-9_]+", str(e))
+    if m:
+        return f"{m.group(0)} at {url}" if url else m.group(0)
+    return str(e).strip()[:200]
+
+
 def navigate_page(sess, args, session_dir):
     t = sess.t
     _ensure_listen(sess)  # 导航前开启:捕获本次页面加载的请求
@@ -581,15 +625,39 @@ def navigate_page(sess, args, session_dir):
         # cdt:本次导航前注入的一次性新文档脚本(navigate 结束即移除)
         init_script_id = (t.run_cdp("Page.addScriptToEvaluateOnNewDocument",
                                     source=str(args["initScript"])) or {}).get("identifier")
+    # DP 失败形态(probe_nav_failures.py 实证):get() 默认吞错返回 False;show_errmsg=True
+    # 才抛 ConnectionError(net::ERR_*)/TimeoutError,但重试路径会 print 污染 stdio 协议
+    # → 必须配 retry=0(单次尝试,失败即抛且无 stdout 输出)。4xx/5xx 加载错误页 = 成功
+    # (上游 goto 同语义,不判失败)。back/forward/reload 无失败信号,静默 = 成功(上游同)。
+    # 失败不抛,响应附 "Unable to navigate ..." 提示行(上游 pages.ts 同款,AI 明确知道失败)。
+    url = str(args.get("url") or "")
+    line = None
     try:
         if typ == "url":
-            t.get(str(args["url"]), timeout=timeout_s) if timeout_s else t.get(str(args["url"]))
+            try:
+                (t.get(url, show_errmsg=True, retry=0, timeout=timeout_s) if timeout_s
+                 else t.get(url, show_errmsg=True, retry=0))
+                line = f"Successfully navigated to {url}."
+            except Exception as e:
+                line = f"Unable to navigate in the selected page: {_nav_reason(e, timeout_s, url)}."
         elif typ == "back":
-            t.back()
+            try:
+                t.back()
+                line = f"Successfully navigated back to {_live_url(sess)}."
+            except Exception as e:
+                line = f"Unable to navigate back in the selected page: {_nav_reason(e)}."
         elif typ == "forward":
-            t.forward()
+            try:
+                t.forward()
+                line = f"Successfully navigated forward to {_live_url(sess)}."
+            except Exception as e:
+                line = f"Unable to navigate forward in the selected page: {_nav_reason(e)}."
         elif typ == "reload":
-            t.refresh(ignore_cache=bool(args.get("ignoreCache")))
+            try:
+                t.refresh(ignore_cache=bool(args.get("ignoreCache")))
+                line = "Successfully reloaded the page."
+            except Exception as e:
+                line = f"Unable to reload the selected page: {_nav_reason(e)}."
         try:
             t.wait.doc_loaded(timeout_s or 15)
         except Exception:
@@ -597,7 +665,7 @@ def navigate_page(sess, args, session_dir):
         # handleBeforeUnload(cdt 默认 accept):导航触发的 beforeunload 弹窗按参数处理
         _handle_dialog_action(sess, args.get("handleBeforeUnload") or "accept")
         _ensure_listen(sess)  # 导航后重启:捕获后续 fetch/xhr
-        return {"url": _live_url(sess), "title": t.title}
+        return {"url": _live_url(sess), "title": t.title, "message": line}
     finally:
         if init_script_id:
             try:
@@ -652,7 +720,8 @@ def _new_tab_in_context(sess, name, url, background):
 
 
 def list_pages(sess, args, session_dir):
-    return {"pages": sess.pages()}
+    note = sess.recover_page_selection()
+    return {"pages": sess.pages(), **({"note": note} if note else {})}
 
 
 def select_page(sess, args, session_dir):
@@ -729,27 +798,43 @@ def _iter_frames(t):
 
 # ---- 截图/执行/调试 ----
 
-def _iframe_viewport_origin(sess, host_bnn):
+def _iframe_viewport_origin(sess, host_bnn, host_sid=None):
     """OOPIF 子视口原点在主视口中的位置:宿主 iframe 元素 border-box 左上 + border + padding。
-    Page.captureScreenshot 是 page 级(主视口系),frame 内 getContentQuads 需此换算。"""
+    Page.captureScreenshot 是 page 级(主视口系),frame 内 getContentQuads 需此换算。
+    宿主元素可能嵌在 OOPIF(嵌套 iframe)内:按候选 session 解析(已知宿主 session
+    优先,再主 session,再其余子 session)。"""
     if not host_bnn:
         return (0.0, 0.0)
-    try:
-        r = sess.t.run_cdp("DOM.resolveNode", backendNodeId=host_bnn)
-        oid = (r.get("object") or {}).get("objectId")
-        if not oid:
-            return (0.0, 0.0)
-        res = sess.t.run_cdp("Runtime.callFunctionOn", objectId=oid, returnByValue=True,
-                             functionDeclaration="""function () {
-                               const b = this.getBoundingClientRect();
-                               const cs = getComputedStyle(this);
-                               return {x: b.left + this.clientLeft + parseFloat(cs.paddingLeft || '0'),
-                                       y: b.top + this.clientTop + parseFloat(cs.paddingTop || '0')};
-                             }""")
-        v = (res.get("result") or {}).get("value") or {}
-        return (float(v.get("x", 0)), float(v.get("y", 0)))
-    except Exception:
-        return (0.0, 0.0)
+    cdp = _session_cdp_safe(sess)
+    candidates = ([host_sid] if host_sid else []) + [None]
+    if cdp:
+        candidates += [s for s in list(cdp.child_sessions) if s not in candidates]
+    def _chan_for(sid):
+        """候选 session 的调用器(默认参绑定 sid,免闭包迟到陷阱)。"""
+        if cdp:
+            return lambda m, timeout=10, session_id=sid, **kw: cdp.call(
+                m, timeout=timeout, session_id=session_id, **kw)
+        return lambda m, timeout=10, session_id=None, **kw: sess.t.run_cdp(m, **kw)
+
+    for sid in candidates:
+        chan = _chan_for(sid)
+        try:
+            r = chan("DOM.resolveNode", backendNodeId=host_bnn)
+            oid = (r.get("object") or {}).get("objectId")
+            if not oid:
+                continue
+            res = chan("Runtime.callFunctionOn", objectId=oid, returnByValue=True,
+                       functionDeclaration="""function () {
+                         const b = this.getBoundingClientRect();
+                         const cs = getComputedStyle(this);
+                         return {x: b.left + this.clientLeft + parseFloat(cs.paddingLeft || '0'),
+                                 y: b.top + this.clientTop + parseFloat(cs.paddingTop || '0')};
+                       }""")
+            v = (res.get("result") or {}).get("value") or {}
+            return (float(v.get("x", 0)), float(v.get("y", 0)))
+        except Exception:
+            continue
+    return (0.0, 0.0)
 
 
 def take_screenshot(sess, args, session_dir):
@@ -781,7 +866,9 @@ def take_screenshot(sess, args, session_dir):
         xs, ys = q[0::2], q[1::2]
         ox, oy = (0.0, 0.0)
         if frame_sid:
-            ox, oy = _iframe_viewport_origin(sess, getattr(sess, "uid_hosts", {}).get(str(uid)))
+            ox, oy = _iframe_viewport_origin(
+                sess, getattr(sess, "uid_hosts", {}).get(str(uid)),
+                getattr(sess, "uid_host_sids", {}).get(str(uid)))
         clip = {"x": min(xs) + ox, "y": min(ys) + oy,
                 "width": max(xs) - min(xs), "height": max(ys) - min(ys), "scale": 1}
     elif full:
@@ -809,7 +896,6 @@ def evaluate_script(sess, args, session_dir):
     args = 快照 uid 列表 → 解为元素对象逐个传入(cdt 同);dialogAction = 执行期间
     弹窗的处理(上游默认 accept:超时检测到弹窗即处理后重试,evaluate 不挂死);
     waitForStableDom 默认 true;filePath = 结果落盘只回文件名。"""
-    t = sess.t
     _check_dialog(sess)
     fn = str(args["function"]).strip()
     if args.get("waitForStableDom") is None or args.get("waitForStableDom"):
@@ -868,7 +954,6 @@ def _eval_fn(sess, frame_sid, fn, dialog_action, handles, attempt=0):
     """函数求值:handles 非空走"函数对象 + callFunctionOn 以元素句柄实参调用"(cdt 同构);
     否则 async 包装直调。整条链走 CdpEvents 带超时——弹窗挂起 renderer 时不返回也不抛,
     超时检测到弹窗按 dialogAction 处理后重试一次(上游默认 accept 的等价实现)。"""
-    t = sess.t
     cdp = ensure_session_cdp(sess)
 
     def send(m, timeout=20, **kw):
@@ -890,7 +975,9 @@ def _eval_fn(sess, frame_sid, fn, dialog_action, handles, attempt=0):
             if attempt == 0 and _dialog_retry(cdp, sess, dialog_action):
                 return _eval_fn(sess, frame_sid, fn, dialog_action, handles, attempt=1)
             raise
-    expr = f"(async () => {{ const f = ({fn}); return await (typeof f === 'function' ? f() : f); }})()"
+    # 语义对齐上游(DEC-021):统一按函数调用,传非函数表达式(如 "1+1")由 JS 抛
+    # TypeError 经 exceptionDetails 上报——上游同样报错,不静默返回表达式值。
+    expr = f"(async () => {{ const f = ({fn}); return await f(); }})()"
     try:
         return send("Runtime.evaluate", expression=expr,
                     returnByValue=True, awaitPromise=True, userGesture=True)
@@ -1011,7 +1098,40 @@ def list_network_requests(sess, args, session_dir):
             "note": "收割模式:每次调用返回新捕获请求;reqid 稳定,get_network_request 按 reqid 查详情"}
 
 
+def _force_ext(path, ext):
+    """cdt saveFile/ensureExtension 语义:给定路径的扩展名替换为规范扩展名
+    (.network-request / .network-response)。"""
+    root, _ = os.path.splitext(str(path))
+    return root + ext
+
+
+def _request_post_data(p):
+    """请求体原文:DP 已按需拉过 Network.getRequestPostData(_raw_post_data);
+    body 内联在事件里时取 _raw_request.request.postData。无 = None。"""
+    raw = getattr(p, "_raw_post_data", None)
+    if raw:
+        return raw
+    req = getattr(p, "_raw_request", None)
+    if isinstance(req, dict):
+        return (req.get("request") or {}).get("postData")
+    return None
+
+
+def _write_body_file(fp, data):
+    """body 落盘:bytes 直写;str UTF-8;dict/list(页面 JSON 被解析)序列化回写。
+    统一二进制写——Windows 文本模式会把 \\n 翻译成 \\r\\n,破坏与内联 body 的一致性。"""
+    if isinstance(data, bytes):
+        raw = data
+    elif isinstance(data, str):
+        raw = data.encode("utf-8")
+    else:
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    with open(fp, "wb") as f:
+        f.write(raw)
+
+
 def get_network_request(sess, args, session_dir):
+    _check_dialog(sess)  # 上游 get_network_request blockedByDialog=true
     buf = getattr(sess, "_net_buffer", None)
     idx = int(args["reqid"])
     if not buf or idx < 0 or idx >= len(buf):
@@ -1026,18 +1146,39 @@ def get_network_request(sess, args, session_dir):
     req_raw = getattr(p, "_raw_request", None) or {}
     resp_raw = getattr(p, "_raw_response", None) or {}
     req_info = req_raw.get("request", {}) if isinstance(req_raw, dict) else {}
-    return {"request": {"reqid": str(idx), "method": p.method, "url": p.url,
-                        "status": getattr(p.response, "status", None),
-                        "statusText": resp_raw.get("statusText"),
-                        "resourceType": (getattr(p, "resourceType", None) or "Other").lower(),
-                        "requestHeaders": req_info.get("headers", {}),
-                        "responseHeaders": resp_raw.get("headers", {}),
-                        "mimeType": resp_raw.get("mimeType"),
-                        "protocol": resp_raw.get("protocol"),
-                        "fromDiskCache": resp_raw.get("fromDiskCache"),
-                        "timing": resp_raw.get("timing"),
-                        "remoteIPAddress": resp_raw.get("remoteIPAddress")},
-            "body": body}
+    out = {"request": {"reqid": str(idx), "method": p.method, "url": p.url,
+                       "status": getattr(p.response, "status", None),
+                       "statusText": resp_raw.get("statusText"),
+                       "resourceType": (getattr(p, "resourceType", None) or "Other").lower(),
+                       "requestHeaders": req_info.get("headers", {}),
+                       "responseHeaders": resp_raw.get("headers", {}),
+                       "mimeType": resp_raw.get("mimeType"),
+                       "protocol": resp_raw.get("protocol"),
+                       "fromDiskCache": resp_raw.get("fromDiskCache"),
+                       "timing": resp_raw.get("timing"),
+                       "remoteIPAddress": resp_raw.get("remoteIPAddress")}}
+    # 落盘参数(cdt 同名参):给 filePath 时该侧 body 不再内联(上游 one-of 语义,
+    # 字段 = requestBodyFilePath/responseBodyFilePath);取不到 body 报占位文案
+    req_fp, resp_fp = args.get("requestFilePath"), args.get("responseFilePath")
+    if req_fp:
+        post = _request_post_data(p)
+        if post:
+            fp = _force_ext(req_fp, ".network-request")
+            _write_body_file(fp, post)
+            out["request_body_file_path"] = fp
+        else:
+            out["request_body"] = "<Request body not available anymore>"
+    if resp_fp:
+        if body is not None:
+            fp = _force_ext(resp_fp, ".network-response")
+            _write_body_file(fp, body)
+            out["response_body_file_path"] = fp
+            body = None  # 已落盘,不再内联(上游同)
+        else:
+            out["response_body"] = "<Response body not available anymore>"
+    if body is not None or not resp_fp:
+        out["body"] = body
+    return out
 
 
 def resize_page(sess, args, session_dir):
@@ -1075,25 +1216,21 @@ _PREDEFINED_NETWORK = {
 
 
 def emulate(sess, args, session_dir):
-    """对齐 cdt(红线内):networkConditions/cpuThrottlingRate/geolocation/colorScheme/
-    extraHttpHeaders。UA 覆盖为 CONSTRAINT-001 明确禁用;viewport 含 mobile/touch
-    指纹信号,同为红线权衡不实现(故意偏离清单)。"""
+    """对齐 cdt McpPage.emulate 的**全量重置**语义:每次调用把未提及的维度重置到默认
+    (清节流 / cpu=1 / geolocation 归 0,0(上游"清除"= 归零,非移除 override)/
+    清 colorScheme);extraHttpHeaders 例外——上游仅显式传参时改动,跨调用持久。
+    校验先于应用(上游 zod schema 先行,非法参数不做任何重置)。
+    UA/viewport 为 CONSTRAINT-001 红线权衡,不实现也不在重置面。"""
     t = sess.t
+    _check_dialog(sess)  # 上游 emulate blockedByDialog=true
     nc = args.get("networkConditions")
-    if nc is not None:
-        if nc == "Offline":
-            t.run_cdp("Network.emulateNetworkConditions", offline=True,
-                      latency=0, downloadThroughput=-1, uploadThroughput=-1)
-        elif nc in _PREDEFINED_NETWORK:
-            t.run_cdp("Network.emulateNetworkConditions", offline=False, **_PREDEFINED_NETWORK[nc])
-        else:
-            raise ValueError(f"networkConditions 必须是 Offline/{' / '.join(_PREDEFINED_NETWORK)},收到 {nc}")
+    if nc is not None and nc != "Offline" and nc not in _PREDEFINED_NETWORK:
+        raise ValueError(f"networkConditions 必须是 Offline/{' / '.join(_PREDEFINED_NETWORK)},收到 {nc}")
     rate = args.get("cpuThrottlingRate")
-    if rate is not None:
-        if not (1 <= rate <= 20):
-            raise ValueError(f"cpuThrottlingRate 必须在 1-20,收到 {rate}")
-        t.run_cdp("Emulation.setCPUThrottlingRate", rate=rate)
+    if rate is not None and not (1 <= rate <= 20):
+        raise ValueError(f"cpuThrottlingRate 必须在 1-20,收到 {rate}")
     geo = args.get("geolocation")
+    lat = lng = 0.0
     if geo is not None:
         try:
             lat_s, lng_s = str(geo).split(",")
@@ -1102,28 +1239,51 @@ def emulate(sess, args, session_dir):
             raise ValueError(f'geolocation 需为 "<latitude>,<longitude>" 格式,收到 {geo}') from None
         if not (-90 <= lat <= 90 and -180 <= lng <= 180):
             raise ValueError(f"geolocation 超出范围: {geo}")
-        t.run_cdp("Emulation.setGeolocationOverride", latitude=lat, longitude=lng, accuracy=100)
     cs = args.get("colorScheme")
-    if cs is not None:
-        if cs == "auto":  # 清除 override(cdt: reset to the default)
-            t.run_cdp("Emulation.setEmulatedMedia", features=[])
-        elif cs in ("dark", "light"):
-            t.run_cdp("Emulation.setEmulatedMedia",
-                      features=[{"name": "prefers-color-scheme", "value": cs}])
-        else:
-            raise ValueError(f"colorScheme 必须是 dark/light/auto,收到 {cs}")
+    if cs is not None and cs not in ("dark", "light", "auto"):
+        raise ValueError(f"colorScheme 必须是 dark/light/auto,收到 {cs}")
     headers = args.get("extraHttpHeaders")
+    parsed_headers = None
     if headers is not None:
         if str(headers).strip() == "":
-            t.run_cdp("Network.setExtraHTTPHeaders", headers={})  # 空串 = 清除
+            parsed_headers = {}
         else:
             try:
-                parsed = json.loads(headers)
+                parsed_headers = json.loads(headers)
             except json.JSONDecodeError as e:
                 raise ValueError(f"Invalid JSON for headers: {e}") from None
-            if not isinstance(parsed, dict):
+            if not isinstance(parsed_headers, dict):
                 raise ValueError("Headers must be a JSON object")
-            t.run_cdp("Network.setExtraHTTPHeaders", headers=parsed)
+
+    # ---- 校验完毕,应用(未提及维度全量重置)----
+    if nc is None:
+        # 上游 emulateNetworkConditions(null):清除节流(吞吐 -1 = 不限速)
+        t.run_cdp("Network.emulateNetworkConditions", offline=False, latency=0,
+                  downloadThroughput=-1, uploadThroughput=-1)
+    elif nc == "Offline":
+        t.run_cdp("Network.emulateNetworkConditions", offline=True,
+                  latency=0, downloadThroughput=-1, uploadThroughput=-1)
+    else:
+        t.run_cdp("Network.emulateNetworkConditions", offline=False, **_PREDEFINED_NETWORK[nc])
+    if rate is None:
+        t.run_cdp("Emulation.setCPUThrottlingRate", rate=1)
+    else:
+        t.run_cdp("Emulation.setCPUThrottlingRate", rate=rate)
+    if geo is None:
+        # 上游"清除" geolocation = setGeolocation({latitude: 0, longitude: 0}):
+        # 归零而非移除 override——geolocation API 之后读到 0,0 而非真实位置
+        t.run_cdp("Emulation.setGeolocationOverride", latitude=0, longitude=0, accuracy=0)
+    else:
+        t.run_cdp("Emulation.setGeolocationOverride", latitude=lat, longitude=lng, accuracy=100)
+    if cs is None or cs == "auto":
+        # 上游清 colorScheme = features 置空值(保留 feature 名,value 清空)
+        t.run_cdp("Emulation.setEmulatedMedia",
+                  features=[{"name": "prefers-color-scheme", "value": ""}])
+    else:
+        t.run_cdp("Emulation.setEmulatedMedia",
+                  features=[{"name": "prefers-color-scheme", "value": cs}])
+    if parsed_headers is not None:
+        t.run_cdp("Network.setExtraHTTPHeaders", headers=parsed_headers)
     return {"done": True}
 
 
@@ -1133,9 +1293,9 @@ def scroll_unknown_state(sess, args, session_dir):
 
 
 # ---- M2/M3 挂载(performance/memory/advanced)——57 工具全量注册 ----
-from . import performance as _perf  # noqa: E402
-from . import memory as _mem  # noqa: E402
 from . import advanced as _adv  # noqa: E402
+from . import memory as _mem  # noqa: E402
+from . import performance as _perf  # noqa: E402
 
 for _mod in (_perf, _mem, _adv):
     for _name in dir(_mod):

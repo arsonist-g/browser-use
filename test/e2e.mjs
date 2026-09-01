@@ -52,6 +52,10 @@ const serverProc = spawn(process.platform === "win32" ? "python" : "python3",
 const serverProc2 = spawn(process.platform === "win32" ? "python" : "python3",
   [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT), "127.0.0.2"],
   { stdio: "ignore", windowsHide: true });
+// 嵌套 iframe 的跨站深页需要 127.0.0.3 第三实例(B 的孙 frame 与 B 跨站 → OOPIF 孙)
+const serverProc3 = spawn(process.platform === "win32" ? "python" : "python3",
+  [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT), "127.0.0.3"],
+  { stdio: "ignore", windowsHide: true });
 let sessionId = null;
 
 async function main() {
@@ -153,9 +157,24 @@ async function main() {
   }
   ok("懒加载第一批被触发(lazy-item-b1)", snap.includes("lazy-item-b1"), "滚动后快照未见懒加载内容");
 
+  // ---- 7.5 iframe 内滚动(uid 落点在同进程 iframe:滚动量按该 frame 读,主文档不动) ----
+  console.log("\n[7.5] iframe 内滚动");
+  bu(["navigate_page", "--session", sessionId, `${BASE}/scroll-host`]);
+  snap = bu(["take_snapshot", "--session", sessionId]);
+  const tallUid = parseSnapUid(snap, "深滚按钮");
+  ok("iframe 内深部按钮取得 uid", !!tallUid);
+  if (tallUid) {
+    const r = JSON.parse(bu(["scroll", "--session", sessionId, "down", "--amount", "400",
+      "--uid", tallUid, "--output-format=json"]));
+    ok("iframe 内滚动生效(scrollY>0,主文档不动)", (r.result?.scrollY ?? 0) > 0,
+       `scrollY=${r.result?.scrollY} wheel_used=${r.result?.wheel_used}`);
+  }
+
   // ---- 8. dialog:工具撞上未处理弹窗报错属 blockedByDialog 预期语义(cdt 同);
   //         handle_dialog accept 后流程恢复 ----
   console.log("\n[8] 对话框");
+  bu(["navigate_page", "--session", sessionId, `${BASE}/`]);  // 回主页([7.5] 曾导航去滚动页)
+  snap = bu(["take_snapshot", "--session", sessionId]);
   const alertUid = parseSnapUid(snap, "弹 alert");
   let dialogErr = null;
   try {
@@ -219,8 +238,32 @@ async function main() {
     catch (e) { ok("跨域 iframe 元素截图", false, e.message.slice(0, 120)); }
   }
 
-  // ---- 11. stop ----
-  console.log("\n[11] 收尾");
+  // ---- 11. 嵌套 frame:A(127.0.0.1)→ B(127.0.0.2,OOPIF)→ 深页两嵌套形态
+  //         (B 内同进程子 frame:same @127.0.0.2;B 内跨站子 frame:xo @127.0.0.3 → OOPIF 孙) ----
+  console.log("\n[11] 嵌套 frame");
+  bu(["navigate_page", "--session", sessionId, `${BASE}/xo-nested`]);
+  await new Promise(r => setTimeout(r, 3000));  // 两层 iframe 加载 + 递归 auto-attach 需要时间
+  snap = bu(["take_snapshot", "--session", sessionId]);
+  ok("嵌套快照含 B 内同进程深页(same)", snap.includes("深页same按钮"),
+     "OOPIF 内同进程子 frame 未拼入——检查 _frame_map 子树遍历");
+  ok("嵌套快照含 B 内跨站深页(xo)", snap.includes("深页xo按钮"),
+     "OOPIF 孙 frame(递归 auto-attach)未拼入");
+  const sameUid = parseSnapUid(snap, "深页same按钮");
+  if (sameUid) {
+    bu(["click", "--session", sessionId, sameUid]);
+    snap = bu(["take_snapshot", "--session", sessionId]);
+    ok("同进程深页点击生效(deep-same-clicked)", snap.includes("deep-same-clicked"));
+  }
+  const xoDeepUid = parseSnapUid(snap, "深页xo按钮");
+  if (xoDeepUid) {
+    bu(["click", "--session", sessionId, xoDeepUid]);
+    snap = bu(["take_snapshot", "--session", sessionId]);
+    ok("跨站深页点击生效(deep-xo-clicked)", snap.includes("deep-xo-clicked"),
+       "OOPIF 孙 uid 点击未路由到其 session");
+  }
+
+  // ---- 12. stop ----
+  console.log("\n[12] 收尾");
   out = bu(["stop", "--session", sessionId]);
   ok("stop → cleaned", out.includes("state=cleaned"), out.slice(0, 120));
 }
@@ -234,6 +277,7 @@ try {
 } finally {
   try { serverProc.kill(); } catch { /* */ }
   try { serverProc2.kill(); } catch { /* */ }
+  try { serverProc3.kill(); } catch { /* */ }
   console.log(`\n===== e2e 汇总: pass=${pass} fail=${fail} skip=${skipped} =====`);
   if (fails.length) console.log("失败项:\n  - " + fails.join("\n  - "));
   process.exit(fail > 0 ? 1 : 0);

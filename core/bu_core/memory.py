@@ -247,7 +247,6 @@ def _node_row(hs, nd, retained):
 
 
 def take_heapsnapshot(sess, args, session_dir):
-    from .cdp_events import CdpEvents
     if getattr(sess, "_cdp", None) is None:
         from .cdp_events import ensure_session_cdp
         ensure_session_cdp(sess)

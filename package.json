@@ -30,7 +30,8 @@
   },
   "scripts": {
     "start": "node bin/browser-use.mjs",
-    "test": "node --test test/unit/core.test.mjs test/unit/skills.test.mjs test/unit/tool-help.test.mjs",
+    "lint:py": "python -m ruff check core/bu_core",
+    "test": "npm run lint:py && node --test test/unit/core.test.mjs test/unit/skills.test.mjs test/unit/tool-help.test.mjs",
     "e2e": "node test/e2e.mjs",
     "all-tools": "node test/all-tools.mjs"
   }

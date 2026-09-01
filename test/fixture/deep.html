@@ -1,0 +1,16 @@
+<!doctype html>
+<!-- 嵌套 iframe 深页:k 参数区分宿主(同进程子 frame / 跨站 OOPIF 孙 frame) -->
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>BU Fixture 深页</title></head>
+<body style="margin:4px">
+<button id="deep-btn" onclick="document.getElementById('deep-log').textContent='deep-clicked'">深页按钮</button>
+<div id="deep-log">(deep 未点击)</div>
+<script>
+  const k = new URLSearchParams(location.search).get('k') || 'same';
+  document.getElementById('deep-btn').textContent = '深页' + k + '按钮';
+  document.getElementById('deep-btn').onclick = function () {
+    document.getElementById('deep-log').textContent = 'deep-' + k + '-clicked';
+  };
+</script>
+</body>
+</html>

@@ -184,7 +184,7 @@ Every tool command requires `--session=<id>` (the id printed by `start`). Requir
 
 | Tool | Description | Parameters | Notes |
 |---|---|---|---|
-| `get_network_request` | Gets one request with body. | `reqid*` | |
+| `get_network_request` | Gets one request with body. | `reqid*` `--requestFilePath` `--responseFilePath` | Optional file paths save the request/response body to disk instead of returning it inline. |
 | `list_network_requests` | Lists network requests. | `--resourceTypes` `--includePreservedRequests` | Returns requests since the previous call. |
 
 ### Debugging (9 tools)

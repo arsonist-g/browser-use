@@ -13,8 +13,6 @@ import json
 import os
 import time
 
-from .cdp_events import CdpEvents
-
 # DevTools Tracing 默认类别(cdt: '-*' + TracingDefaultCategories + JsSampling + Screenshot)
 _TRACE_CATEGORIES = [
     "-*",

@@ -17,9 +17,10 @@ _SKIP_ROLES = {"none", "generic", "genericContainer", "InlineTextBox", "LineBrea
 
 
 def _frame_map(cdp):
-    """frame 归属表:{frameId: {"session": sid|None, "parent": frameId|None}}。
-    主 session 的 getFrameTree 给出主 frame + 同进程子 frame(OOPIF 不在其中,
-    由各 OOPIF 子 session 的 getFrameTree 补 own frameId,parent 未知记 None)。"""
+    """frame 归属表:{frameId: {"session": sid|None, "parent": frameId|None, "root": bool}}。
+    主 session 的 getFrameTree 给出主 frame + 同进程子 frame;OOPIF 由各子 session 的
+    getFrameTree 补齐——其树内也含同进程子 frame(同一进程、无独立 target),全部登记
+    session 归属;root 标记该 frame 是否为所属 session 树的根(取树方式据此区分)。"""
     frames = {}
     try:
         ft = (cdp.call("Page.getFrameTree", timeout=10) or {}).get("frameTree") or {}
@@ -29,7 +30,7 @@ def _frame_map(cdp):
     def walk(node, parent):
         fid = (node.get("frame") or {}).get("id")
         if fid:
-            frames[fid] = {"session": None, "parent": parent}
+            frames[fid] = {"session": None, "parent": parent, "root": parent is None}
         for c in node.get("childFrames") or []:
             walk(c, fid)
 
@@ -38,63 +39,98 @@ def _frame_map(cdp):
         try:
             sub = (cdp.call("Page.getFrameTree", timeout=10, session_id=sid)
                    or {}).get("frameTree") or {}
-            fid = (sub.get("frame") or {}).get("id")
-            if not fid:
-                continue
-            frames.setdefault(fid, {"session": None, "parent": None})["session"] = sid
         except Exception:
             continue
+        sub_root = (sub.get("frame") or {}).get("id")
+        # 子 session 树全量走:OOPIF 根 + 其同进程子 frame(session 归属该子 session);
+        # sid/sub_root 经默认参绑定(B023:闭包引用循环变量是潜在陷阱)
+        def walk_sub(node, parent, sid=sid, sub_root=sub_root):
+            fid = (node.get("frame") or {}).get("id")
+            if fid:
+                info = frames.setdefault(fid, {"session": sid, "parent": parent,
+                                               "root": fid == sub_root})
+                info["session"] = sid  # 自有 target 的 session 优先(同进程归属随后覆盖)
+                if fid == sub_root:
+                    info["root"] = True
+            for c in node.get("childFrames") or []:
+                walk_sub(c, fid, sid, sub_root)
+        walk_sub(sub, None)
     return frames
+
+
+def _frame_owner(cdp, fid, parent_sid, frames):
+    """DOM.getFrameOwner 按候选 session 解析:已知 parent session 优先,否则主 session,
+    再逐个其余子 session(嵌套 OOPIF 的 owner 元素在宿主 OOPIF 的文档里)。"""
+    candidates = []
+    if parent_sid:
+        candidates.append(parent_sid)
+    candidates.append(None)
+    candidates += [s for s in list(cdp.child_sessions) if s not in candidates]
+    for sid in candidates:
+        try:
+            owner = cdp.call("DOM.getFrameOwner", frameId=fid, timeout=10,
+                             session_id=sid)
+        except Exception:
+            continue
+        if owner and owner.get("backendNodeId"):
+            return owner
+    return None
 
 
 def _splice_frames(cdp, nodes, by_id, children):
     """全部子 frame 取 AX 树拼进宿主 Iframe 节点(对齐上游 TextSnapshot includeIframes)。
-    同进程子 frame:主 session 带 frameId 参数直取(实测支持);OOPIF:子 session 取。
-    宿主挂点 = DOM.getFrameOwner(frameId) 的 backendNodeId(宿主 frame 的 session 发,
-    OOPIF parent 未知时发主 session 亦可解析)。宿主定位在已并入节点的 backendDOMNodeId
-    索引中(backendNodeId 浏览器级唯一)。返回 (frame_nodes, host_nodes)。"""
+    取树规则:session 树根(独立 target)整树取;session 内同进程子 frame 带 frameId
+    参数在该 session 取;主 session 下同进程子 frame 带 frameId 在主 session 取。
+    宿主挂点 = DOM.getFrameOwner(frameId).backendNodeId 在已并入节点的 backendDOMNodeId
+    索引中定位(宿主先拼入才可挂——attach 序保证外层先;失败者二轮重试)。
+    返回 (frame_nodes, host_nodes, node_frame_ids)。"""
     frame_nodes = {}
     host_nodes = {}
+    host_sids = {}
+    node_frame_ids = {}
     frames = _frame_map(cdp)
     if not frames:
-        return frame_nodes, host_nodes
+        return frame_nodes, host_nodes, node_frame_ids, host_sids
     main_fid = next((f for f, i in frames.items()
                      if i["parent"] is None and not i["session"]), None)
-    # 处理序:同进程 frame 按 frameTree 自顶向下(BFS),OOPIF 按 attach 序追加
-    # (浏览器外层 frame 先 attach,嵌套时宿主 OOPIF 先拼入)
+    # 初序:主树同进程 frame BFS 自顶向下,OOPIF(含其同进程子 frame)按 attach 序追加
     order = []
     queue = [main_fid] if main_fid else []
     while queue:
         fid = queue.pop(0)
         for f, i in frames.items():
-            if i["parent"] == fid and not i["session"]:
+            if i["parent"] == fid and f not in order:
                 order.append(f)
                 queue.append(f)
-    order += [f for f, i in frames.items() if i["session"]]
+    order += [f for f in frames if f not in order]
 
     bnn_index = {}
     for n in nodes:
         if n.get("backendDOMNodeId") is not None:
             bnn_index.setdefault(n["backendDOMNodeId"], n["nodeId"])
 
-    merged = 0
-    for fid in order:
+    def fetch_tree(fid):
         info = frames[fid]
         sid = info["session"]
-        parent_sid = frames.get(info["parent"], {}).get("session") if info["parent"] else None
         try:
-            owner = cdp.call("DOM.getFrameOwner", frameId=fid, timeout=10,
-                             session_id=parent_sid)
-            if sid:
-                sub_tree = cdp.call("Accessibility.getFullAXTree", timeout=10, session_id=sid)
-            else:
-                sub_tree = cdp.call("Accessibility.getFullAXTree", timeout=10, frameId=fid)
+            if sid and info.get("root"):
+                return cdp.call("Accessibility.getFullAXTree", timeout=10, session_id=sid)
+            return cdp.call("Accessibility.getFullAXTree", timeout=10,
+                            session_id=sid, frameId=fid)
         except Exception:
-            continue
+            return None
+
+    def splice_one(fid, merged):
+        info = frames[fid]
+        owner = _frame_owner(cdp, fid, frames.get(info["parent"], {}).get("session")
+                             if info["parent"] else None, frames)
+        sub_tree = fetch_tree(fid)
+        if not owner or not sub_tree:
+            return False
         host_nid = bnn_index.get(owner.get("backendNodeId"))
         sub_nodes = sub_tree.get("nodes") or []
         if not host_nid or not sub_nodes:
-            continue
+            return False
         # 子树 nodeId 加前缀防跨 frame 冲突,并入合并结构
         pref = f"s{merged}_"
         for n in sub_nodes:
@@ -106,16 +142,33 @@ def _splice_frames(cdp, nodes, by_id, children):
         sub_roots = [n["nodeId"] for n in sub_nodes if n["nodeId"] not in sub_parents]
         for n in sub_nodes:  # 先全量入 by_id 再算 children(子节点可能后于父出现)
             by_id[n["nodeId"]] = n
+        sid = info["session"]
+        parent_sid = frames.get(info["parent"], {}).get("session") if info["parent"] else None
         for n in sub_nodes:
             children[n["nodeId"]] = [c for c in n["childIds"] if c in by_id]
             if sid:
+                # 树来自非主 session:uid 消费按该 session 路由(backendNodeId 属该
+                # target 的 DOM agent——含 OOPIF 内同进程子 frame 的节点)
                 frame_nodes[n["nodeId"]] = sid
             host_nodes[n["nodeId"]] = owner.get("backendNodeId")
+            host_sids[n["nodeId"]] = parent_sid  # 宿主元素所在 frame 的 session
+            node_frame_ids[n["nodeId"]] = fid
             if n.get("backendDOMNodeId") is not None:
                 bnn_index.setdefault(n["backendDOMNodeId"], n["nodeId"])
         children[host_nid] = children.get(host_nid, []) + sub_roots
-        merged += 1
-    return frame_nodes, host_nodes
+        return True
+
+    done = set()
+    pending = [f for f in order if f != main_fid]
+    for round_i in (0, 1):  # 二轮:宿主后拼入的(嵌套)frame 重试一次
+        retry = []
+        for fid in pending:
+            if splice_one(fid, len(done)):
+                done.add(fid)
+            elif round_i == 0:
+                retry.append(fid)
+        pending = retry
+    return frame_nodes, host_nodes, node_frame_ids, host_sids
 
 
 def build_snapshot(sess, verbose=False):
@@ -134,7 +187,11 @@ def build_snapshot(sess, verbose=False):
     for n in nodes:
         nid = n["nodeId"]
         children[nid] = [c for c in n.get("childIds", []) if c in by_id]
-    frame_nodes, host_nodes = _splice_frames(cdp, nodes, by_id, children) if cdp else ({}, {})
+    if cdp:
+        frame_nodes, host_nodes, node_frame_ids, host_sids = _splice_frames(
+            cdp, nodes, by_id, children)
+    else:
+        frame_nodes = host_nodes = node_frame_ids = host_sids = {}
     # 根:无父者(拼接后子树根已有宿主父,不会误判为顶层)
     has_parent = set()
     for kids in children.values():
@@ -145,6 +202,8 @@ def build_snapshot(sess, verbose=False):
     uid_map = {}
     uid_frames = {}
     uid_hosts = {}
+    uid_frame_ids = {}
+    uid_host_sids = {}
 
     def role_of(n):
         return (n.get("role") or {}).get("value", "")
@@ -176,6 +235,9 @@ def build_snapshot(sess, verbose=False):
         if nid in frame_nodes:
             uid_frames[uid] = frame_nodes[nid]
             uid_hosts[uid] = host_nodes.get(nid)
+            uid_host_sids[uid] = host_sids.get(nid)
+        if nid in node_frame_ids:
+            uid_frame_ids[uid] = node_frame_ids[nid]
         attrs = props_of(n)
         url = (n.get("value") or {}).get("value") if role in ("link",) else None
         label = f'{role}' + (f' "{name}"' if name else "") + (f' url="{url}"' if url else "") + attrs
@@ -205,6 +267,8 @@ def build_snapshot(sess, verbose=False):
     sess.uid_map = uid_map
     sess.uid_frames = uid_frames
     sess.uid_hosts = uid_hosts
+    sess.uid_frame_ids = uid_frame_ids
+    sess.uid_host_sids = uid_host_sids
     return {"text": text, "uid_count": len(uid_map), "scroll": scroll}
 
 

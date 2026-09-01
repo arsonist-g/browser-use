@@ -3,6 +3,7 @@
 红线(CONSTRAINT-001):不启用 Runtime.enable;不做 UA/平台/语言覆盖。
 """
 import os
+
 from DrissionPage import Chromium, ChromiumOptions
 
 # console.* 捕获 hook:Console 域在新版 Edge/Chrome 不再派发事件(实测 enable 成功但 0 事件),
@@ -66,6 +67,8 @@ class BrowserSession:
         self.uid_map = {}   # uid -> a11y node(backendNodeId 等)
         self.uid_frames = {}  # uid -> OOPIF 子 sessionId(空 = 主 frame)
         self.uid_hosts = {}   # uid -> 宿主 iframe backendNodeId(OOPIF 截图坐标换算用)
+        self.uid_frame_ids = {}  # uid -> 所属子 frameId(同进程 iframe 滚动/求值定位用)
+        self.uid_host_sids = {}  # uid -> 宿主元素所在 frame 的 session(嵌套截图换算用)
         self.snapshot_seq = 0
 
     def start(self):
@@ -133,8 +136,10 @@ class BrowserSession:
         cur_id = getattr(self.tab, "tab_id", None)
         if cur_id is not None and any(tb.tab_id == cur_id for tb in tabs):
             return self.tab
-        self.tab = tabs[0]
-        return self.tab
+        # 选中页已被关闭:对齐 cdt getSelectedMcpPage 语义——page 工具立即报错引导
+        # list_pages,不静默换页(静默回退会让 AI 在错误的页上继续操作);
+        # 恢复走 list_pages(自动回退 + 提示行)或 select_page。
+        raise ValueError("The selected page has been closed. Call list_pages to see open pages.")
 
     def _whitelist_paths(self):
         """白名单扩展目录(Should 机制;首版无实现,恒空 = 全禁扩展)。"""
@@ -159,9 +164,26 @@ class BrowserSession:
         return [{"page_id": str(i), "url": t.url, "title": t.title}
                 for i, t in enumerate(self.browser.get_tabs())]
 
+    def recover_page_selection(self):
+        """上游 createPagesSnapshot 语义:选中页已关时自动回退 pages[0] 并留痕。
+        返回提示行(无回退发生时 None);由 list_pages 附进响应。"""
+        tabs = self.browser.get_tabs()
+        if not tabs:
+            return None
+        cur_id = getattr(self.tab, "tab_id", None)
+        if cur_id is not None and any(tb.tab_id == cur_id for tb in tabs):
+            return None
+        if self.tab is None:
+            return None
+        self.tab = tabs[0]
+        return "Note: the previously selected page was closed. Page 0 is now selected."
+
     def select_page(self, page_id):
         tabs = self.browser.get_tabs()
-        self.tab = tabs[int(page_id)]
+        idx = int(page_id)
+        if idx < 0 or idx >= len(tabs):
+            raise ValueError("No page found")  # 文案对齐 cdt getPageById
+        self.tab = tabs[idx]
 
     def stop(self):
         try:

@@ -33,6 +33,9 @@ function parseSnapUid(text, labelIncludes) {
 
 const serverProc = spawn(process.platform === "win32" ? "python" : "python3",
   [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT)], { stdio: "ignore", windowsHide: true });
+// 跨源 preflight 用例需要 127.0.0.2 上的同端口实例(同端口不同 host = 跨源)
+const serverProc2 = spawn(process.platform === "win32" ? "python" : "python3",
+  [path.join(ROOT, "test", "fixture", "server.py"), String(FIXTURE_PORT), "127.0.0.2"], { stdio: "ignore", windowsHide: true });
 let sessionId = null;
 
 async function main() {
@@ -172,7 +175,39 @@ async function main() {
   } catch (e) { mark("click_at", "FAIL", e.message); }
 
   // ========== Navigation (6) ==========
-  try { bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]); mark("navigate_page", "PASS"); } catch (e) { mark("navigate_page", "FAIL", e.message); }
+  try { const r = bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]);
+        mark("navigate_page", /Successfully navigated to/.test(r) ? "PASS" : "FAIL", r.slice(0, 90)); } catch (e) { mark("navigate_page", "FAIL", e.message); }
+  // navigate_page 失败提示行(cdt pages.ts 同款):连接拒绝不抛,附 "Unable to navigate ..."
+  try {
+    const r = tryBu(["navigate_page", "--session", sessionId, "http://127.0.0.1:9/"]);
+    mark("navigate_page(失败提示行)", r.ok && /Unable to navigate in the selected page/.test(r.out)
+      && /net::ERR_/.test(r.out) ? "PASS" : "FAIL", r.out.slice(0, 120));
+  } catch (e) { mark("navigate_page(失败提示行)", "FAIL", e.message); }
+  // 4xx/5xx = 加载错误页,属成功(上游 goto 同语义,不判失败)
+  try {
+    const r4 = bu(["navigate_page", "--session", sessionId, `${BASE}/no-such-page-404`]);
+    const r5 = bu(["navigate_page", "--session", sessionId, `${BASE}/five-hundred`]);
+    mark("navigate_page(4xx/5xx=成功)", /Successfully navigated/.test(r4) && /Successfully navigated/.test(r5)
+      ? "PASS" : "FAIL", `404:${r4.slice(0, 50)} 500:${r5.slice(0, 50)}`);
+  } catch (e) { mark("navigate_page(4xx/5xx=成功)", "FAIL", e.message); }
+  // 加载超时:--timeout(毫秒)传入 → "Unable to navigate ... Navigation timeout"
+  try {
+    const t0 = Date.now();
+    const r = tryBu(["navigate_page", "--session", sessionId, `${BASE}/slow?ms=5000`, "--timeout", "900"]);
+    const dt = Date.now() - t0;
+    mark("navigate_page(超时提示行)", r.ok && /Unable to navigate/.test(r.out) && /Navigation timeout/.test(r.out)
+      && dt < 15000 ? "PASS" : "FAIL", `${r.out.slice(0, 100)} 耗时=${dt}ms`);
+  } catch (e) { mark("navigate_page(超时提示行)", "FAIL", e.message); }
+  // back/forward/reload 成功提示行(上游每型一行;先回主页避免 slow 页拖长 reload)
+  try {
+    bu(["navigate_page", "--session", sessionId, `${BASE}/`]);
+    const rb = bu(["navigate_page", "--session", sessionId, "--type", "back"]);
+    const rf = bu(["navigate_page", "--session", sessionId, "--type", "forward"]);
+    const rr = bu(["navigate_page", "--session", sessionId, "--type", "reload"]);
+    mark("navigate_page(back/fwd/reload 提示行)", /Successfully navigated back/.test(rb)
+      && /Successfully navigated forward/.test(rf) && /Successfully reloaded/.test(rr) ? "PASS" : "FAIL",
+      `${rb.slice(0, 40)} | ${rf.slice(0, 40)} | ${rr.slice(0, 40)}`);
+  } catch (e) { mark("navigate_page(back/fwd/reload 提示行)", "FAIL", e.message); }
   // navigate_page initScript:一次性新文档脚本(cdt 同名参),本导航内生效
   try {
     bu(["navigate_page", "--session", sessionId, `${BASE}/`, "--initScript", "window.__buMarker = 41 + 1;"]);
@@ -183,6 +218,11 @@ async function main() {
         mark("new_page", r.page_id !== undefined && Array.isArray(r.pages) && r.pages.length >= 2 ? "PASS" : "FAIL", `page_id=${r.page_id} pages=${r.pages?.length}`); } catch (e) { mark("new_page", "FAIL", e.message); }
   try { const r = bu(["list_pages", "--session", sessionId]); mark("list_pages", r.includes("page") ? "PASS" : "FAIL"); } catch (e) { mark("list_pages", "FAIL", e.message); }
   try { bu(["select_page", "--session", sessionId, "0"]); mark("select_page", "PASS"); } catch (e) { mark("select_page", "FAIL", e.message); }
+  // select_page 越界:文案对齐 cdt getPageById("No page found"),非 IndexError
+  try {
+    const r = tryBu(["select_page", "--session", sessionId, "999"]);
+    mark("select_page(越界文案)", !r.ok && /No page found/.test(r.out) ? "PASS" : "FAIL", r.out.slice(0, 80));
+  } catch (e) { mark("select_page(越界文案)", "FAIL", e.message); }
   try { bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]); bu(["close_page", "--session", sessionId, "1"]); mark("close_page", "PASS"); } catch (e) { mark("close_page", "FAIL", e.message); }
   try { bu(["navigate_page", "--session", sessionId, `${BASE}/`]); bu(["wait_for", "--session", sessionId, "BU Fixture 主页"]); mark("wait_for", "PASS"); } catch (e) { mark("wait_for", "FAIL", e.message); }
   // wait_for 跨 frame:目标文本只在 iframe(child.html)内,主文档无(cdt waitForTextOnPage 同语义)
@@ -241,6 +281,22 @@ async function main() {
     const geoOk = Array.isArray(geo.value) && Math.abs(geo.value[0] - 10.5) < 1 && Math.abs(geo.value[1] - 20.5) < 1;
     mark("emulate", cs.value === true && geoOk && off.value === true ? "PASS" : "FAIL",
       `dark=${cs.value} geo=${JSON.stringify(geo.value)} offline_fetch_rejected=${off.value}`);
+    // emulate 全量重置语义(cdt McpPage.emulate):未提及维度每次调用重置。
+    // 组合用例:Slow 3G 节流 → emulate(colorScheme) 单参调用 → 节流必须已清 + geo 归 0,0
+    const fetchMs = () => JSON.parse(bu(["evaluate_script", "--session", sessionId,
+      `async () => { const t0 = performance.now(); await fetch('${BASE}/', {cache: 'no-store'}); return Math.round(performance.now() - t0); }`,
+      "--output-format=json"])).value;
+    bu(["emulate", "--session", sessionId, "--networkConditions", "Slow 3G"]);
+    const slowMs = await fetchMs();
+    bu(["emulate", "--session", sessionId, "--colorScheme", "dark"]);  // 未提 network/geo → 全量重置
+    const resetMs = await fetchMs();
+    const geoReset = JSON.parse(bu(["evaluate_script", "--session", sessionId,
+      "() => new Promise(res => navigator.geolocation.getCurrentPosition(p => res([p.coords.latitude, p.coords.longitude]), e => res('DENIED'), {timeout: 4000}))",
+      "--output-format=json"]));
+    const resetOk = slowMs > 1000 && resetMs < 1000
+      && Array.isArray(geoReset.value) && geoReset.value[0] === 0 && geoReset.value[1] === 0;
+    mark("emulate(全量重置)", resetOk ? "PASS" : "FAIL",
+      `slow3G=${slowMs}ms 重置后=${resetMs}ms geo重置=${JSON.stringify(geoReset.value)}(上游语义:清除=归0,0)`);
   } catch (e) { mark("emulate", "FAIL", e.message); }
 
   // ========== Performance (3) ==========
@@ -289,12 +345,52 @@ async function main() {
         mark("get_network_request", j.request?.url && "resourceType" in j.request ? "PASS" : "FAIL", r.slice(0, 100));
         const bad = tryBu(["get_network_request", "--session", sessionId, "99999"]);
         mark("get_network_request(未找到报错)", !bad.ok && /Request not found/i.test(bad.out) ? "PASS" : "FAIL", bad.out.slice(0, 80)); } catch (e) { mark("get_network_request", "FAIL", e.message.slice(0, 120)); }
+  // resourceType 映射覆盖(B7 实测):fetch/xhr/ping 必须正确归类。
+  // preflight 实证结构性缺失:跨源自定义头请求的 OPTIONS 预检已发生(必发),但 CDP
+  // Network 域不为其派发常规事件(仅 ExtraInfo,DP 收割通道不建包)→ 任何 DP 管道都见不到
+  try {
+    bu(["navigate_page", "--session", sessionId, `${BASE}/net-types`]);
+    await new Promise(r => setTimeout(r, 2000));  // 等 fetch/xhr/beacon 发出
+    const j = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--output-format=json"]));
+    const types = new Set((j.requests ?? []).map(q => q.resourceType));
+    const want = ["fetch", "xhr", "ping"];
+    const missing = want.filter(t => !types.has(t));
+    mark("list_network_requests(resourceType 覆盖)", missing.length === 0 ? "PASS" : "FAIL",
+      `实际类型=[${[...types].join(",")}] 缺=${missing.join(",") || "无"}(preflight 见注释:CDP 不派发,结构性缺失)`);
+  } catch (e) { mark("list_network_requests(resourceType 覆盖)", "FAIL", e.message); }
+  // get_network_request 落盘(cdt requestFilePath/responseFilePath):文件存在且与内联 body 一致;
+  // 扩展名按 cdt ensureExtension 语义强制替换(.network-request / .network-response)
+  try {
+    bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]);
+    const j = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--output-format=json"]));
+    const doc = (j.requests ?? []).find(q => q.resourceType === "document" && q.url.endsWith("child.html"));
+    if (!doc) throw new Error("未找到 document 请求");
+    const inline = JSON.parse(bu(["get_network_request", "--session", sessionId, doc.reqid, "--output-format=json"]));
+    const respPath = path.join(ROOT, "test", "fixture", ".tmp-resp.txt");
+    const reqPath = path.join(ROOT, "test", "fixture", ".tmp-req.txt");
+    const r = JSON.parse(bu(["get_network_request", "--session", sessionId, doc.reqid, "--output-format=json",
+      "--responseFilePath", respPath, "--requestFilePath", reqPath]));
+    const savedOk = r.response_body_file_path
+      && String(r.response_body_file_path).endsWith(".network-response")
+      && fs.existsSync(r.response_body_file_path)
+      && fs.readFileSync(r.response_body_file_path, "utf8") === String(inline.body ?? "");
+    const reqPlaceholder = r.request_body === "<Request body not available anymore>" || r.request_body_file_path !== undefined;
+    mark("get_network_request(落盘)", savedOk && reqPlaceholder && inline.body !== undefined && r.body === undefined ? "PASS" : "FAIL",
+      `saved=${r.response_body_file_path} 内容一致=${savedOk} req侧=${reqPlaceholder ? "ok" : "unexpected"} body内联=${inline.body !== undefined}`);
+    try { if (r.response_body_file_path) fs.unlinkSync(r.response_body_file_path); } catch { /* */ }
+    try { if (r.request_body_file_path) fs.unlinkSync(r.request_body_file_path); } catch { /* */ }
+  } catch (e) { mark("get_network_request(落盘)", "FAIL", e.message.slice(0, 140)); }
 
   // ========== Debugging (8) ==========
   try { const r = bu(["evaluate_script", "--session", sessionId, "() => 6*7", "--output-format=json"]); mark("evaluate_script", r.includes("42") ? "PASS" : "FAIL", r.slice(0, 100)); } catch (e) { mark("evaluate_script", "FAIL", e.message); }
   // evaluate_script:async 函数支持(cdt 明示 async;awaitPromise 语义)
   try { const r = JSON.parse(bu(["evaluate_script", "--session", sessionId, "async () => (await Promise.resolve(6)) * 7", "--output-format=json"]));
         mark("evaluate_script(async)", r.value === 42 ? "PASS" : "FAIL", JSON.stringify(r).slice(0, 90)); } catch (e) { mark("evaluate_script(async)", "FAIL", e.message); }
+  // evaluate_script 非函数表达式必须报错(DEC-021 对齐上游:统一按函数调用,不宽容表达式)
+  try {
+    const r = tryBu(["evaluate_script", "--session", sessionId, "1+1"]);
+    mark("evaluate_script(非函数报错)", !r.ok && /not a function/i.test(r.out) ? "PASS" : "FAIL", r.out.slice(0, 100));
+  } catch (e) { mark("evaluate_script(非函数报错)", "FAIL", e.message); }
   try {
     bu(["navigate_page", "--session", sessionId, `${BASE}/`]); // fixture 载入自带 console.log/warn 样本
     const r = JSON.parse(bu(["list_console_messages", "--session", sessionId, "--output-format=json"]));
@@ -312,15 +408,23 @@ async function main() {
   } catch (e) { mark("list_console_messages", "FAIL", e.message); mark("get_console_message", "FAIL", e.message.slice(0, 100)); }
   try {
     bu(["navigate_page", "--session", sessionId, `${BASE}/`]);
+    // lighthouse 跑后 viewport/DPR 复原(B8 实测项):断言 override 无残留(上游 restoreEmulation 语义)
+    const vpOf = () => JSON.parse(bu(["evaluate_script", "--session", sessionId,
+      "() => [window.innerWidth, window.innerHeight, window.devicePixelRatio]", "--output-format=json"])).value;
+    const vpBefore = vpOf();
     const r = bu(["lighthouse_audit", "--session", sessionId, "--output-format=json", "--timeout", "300000"], 330000);
     const j = JSON.parse(r);
     const cats = (j.summary?.scores ?? []).map(s => s.id);
     mark("lighthouse_audit", cats.includes("accessibility") && cats.includes("agentic-browsing")
       && (j.reports ?? []).length >= 1 ? "PASS" : "FAIL",
       `categories=${cats.join(",")} reports=${j.reports?.length}`);
+    const vpAfter = vpOf();
+    mark("lighthouse(viewport 复原)", JSON.stringify(vpBefore) === JSON.stringify(vpAfter) ? "PASS" : "FAIL",
+      `before=${JSON.stringify(vpBefore)} after=${JSON.stringify(vpAfter)}`);
   } catch (e) {
     const msg = e.message ?? "";
     mark("lighthouse_audit", /lighthouse|npx|ENOTFOUND|not installed/i.test(msg) ? "SKIP" : "FAIL", msg.slice(0, 140));
+    mark("lighthouse(viewport 复原)", "SKIP", "依赖 lighthouse_audit 成功");
   }
   try { const r = bu(["take_screenshot", "--session", sessionId]); mark("take_screenshot", r.includes("path") ? "PASS" : "FAIL"); } catch (e) { mark("take_screenshot", "FAIL", e.message); }
   try { snap = bu(["take_snapshot", "--session", sessionId]); mark("take_snapshot", snap.includes("BU Fixture") || snap.includes("子页") ? "PASS" : "FAIL"); } catch (e) { mark("take_snapshot", "FAIL", e.message); }
@@ -541,6 +645,21 @@ async function main() {
     mark("uninstall_pwa", gone ? "PASS" : "FAIL", "卸载后状态仍可查");
   } catch (e) { mark("uninstall_pwa", "FAIL", e.message.slice(0, 120)); }
 
+  // ========== 选中页关闭语义(cdt 同:page 工具报错引导 list_pages;list_pages 自动回退 + 提示行) ==========
+  try {
+    const pg = JSON.parse(bu(["new_page", "--session", sessionId, `${BASE}/child.html`, "--output-format=json"]));
+    bu(["select_page", "--session", sessionId, pg.page_id]);
+    // 关闭当前选中页(page_id = 最后一个)
+    bu(["close_page", "--session", sessionId, pg.page_id]);
+    const after = tryBu(["take_snapshot", "--session", sessionId]);
+    const closedOk = !after.ok && /selected page has been closed/i.test(after.out);
+    const lp = bu(["list_pages", "--session", sessionId, "--output-format=json"]);
+    const noteOk = /previously selected page was closed/.test(lp);
+    const recovered = (() => { try { bu(["take_snapshot", "--session", sessionId]); return true; } catch { return false; } })();
+    mark("选中页关闭语义", closedOk && noteOk && recovered ? "PASS" : "FAIL",
+      `closed报错=${closedOk} 回退提示=${noteOk} 恢复可用=${recovered}`);
+  } catch (e) { mark("选中页关闭语义", "FAIL", e.message.slice(0, 140)); }
+
   // ========== new_page(isolatedContext)——置于矩阵尾部:Edge 152 headless 下
   // pipe createBrowserContext 组合操作存在非确定性崩溃(0xC0000005,daemon.log 实录),
   // 避免其偶发触发污染其余断言;崩溃本体为浏览器侧问题,记录于审查报告 ==========
@@ -552,6 +671,8 @@ async function main() {
 
   // ---------- 汇总 ----------
   try { bu(["stop", "--session", sessionId]); } catch { /* */ }
+  try { serverProc.kill(); } catch { /* */ }
+  try { serverProc2.kill(); } catch { /* */ }
   const entries = Object.entries(results);
   const p = entries.filter(([, v]) => v.status === "PASS").length;
   const f = entries.filter(([, v]) => v.status === "FAIL").length;
