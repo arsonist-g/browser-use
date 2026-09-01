@@ -41,7 +41,9 @@ test("install/status/uninstall: 完整生命周期", () => {
 
   const r = installSkill(ROOT, dest);
   assert.equal(r.ok, true);
-  assert.ok(r.files >= 2, "至少 SKILL.md + SKILL-ZH.md 两个文件");
+  assert.ok(r.files >= 1, "至少 SKILL.md");
+  assert.ok(!fs.existsSync(path.join(dest, "SKILL-ZH.md")),
+    "SKILL-ZH.md 是开发审核稿,不得被安装");
   assert.equal(skillStatus(ROOT, dest).state, "up_to_date");
   assert.ok(fs.existsSync(path.join(dest, "SKILL.md")));
 

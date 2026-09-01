@@ -16,6 +16,7 @@
     "!core/**/__pycache__/",
     "extension/",
     "skills/",
+    "!skills/browser-use/SKILL-ZH.md",
     "README-ZH.md"
   ],
   "bin": {
