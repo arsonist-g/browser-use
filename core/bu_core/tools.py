@@ -57,13 +57,19 @@ def _session_cdp_safe(sess):
 
 def _check_dialog(sess):
     """blockedByDialog 预检(对齐上游 ToolHandler):弹窗挂起时立即报错引导
-    handle_dialog,而非让后续 CDP 调用挂死。挂到交互/执行类工具入口。"""
+    handle_dialog,而非让后续 CDP 调用挂死。挂到交互/执行类工具入口。
+    例外:beforeunload 型(离开确认弹窗)自动 accept——它挂起的是导航离开,对
+    AI 任务是纯噪音(用户裁决屏蔽),放行导航而非拦截工具;alert/confirm/prompt
+    是页面逻辑弹窗,维持显式 handle_dialog 语义。"""
     cdp = _session_cdp_safe(sess)
     if not cdp:
         return
     cdp.pump()
     if cdp.dialog_state:
         d = cdp.dialog_state
+        if d.get("type") == "beforeunload":
+            _handle_dialog_action(sess, "accept")
+            return
         raise ValueError(f'A dialog is open ({d.get("type")}: {d.get("message")})。'
                          f" Use handle_dialog to accept or dismiss it first.")
 
@@ -701,7 +707,7 @@ def _nav_reason(e, timeout_s=None, url=None):
     """失败原因对齐上游 error.message 形态:超时 → "Navigation timeout of N ms exceeded";
     网络错误 → 取 CDP errorText(net::ERR_*),附 " at <url>"(puppeteer 同款)。"""
     if isinstance(e, TimeoutError):
-        ms = int(timeout_s * 1000) if timeout_s else 30000
+        ms = int(timeout_s * 1000) if timeout_s else 20000  # 无显式 timeout 时的默认导航预算
         return f"Navigation timeout of {ms} ms exceeded"
     m = re.search(r"net::ERR_[A-Z0-9_]+", str(e))
     if m:
@@ -727,14 +733,39 @@ def navigate_page(sess, args, session_dir):
     # 失败不抛,响应附 "Unable to navigate ..." 提示行(上游 pages.ts 同款,AI 明确知道失败)。
     url = str(args.get("url") or "")
     line = None
+    # 默认预算必须小于 daemon→core RPC 上限(30s):DP get() 无 timeout 时用 page_load
+    # 默认 30s,叠加 doc_loaded(15) 最坏 45s → 慢导航必然 CORE_TIMEOUT
+    nav_timeout = timeout_s if timeout_s is not None else 20.0
     try:
         if typ == "url":
             try:
-                (t.get(url, show_errmsg=True, retry=0, timeout=timeout_s) if timeout_s
-                 else t.get(url, show_errmsg=True, retry=0))
+                t.get(url, show_errmsg=True, retry=0, timeout=nav_timeout)
                 line = f"Successfully navigated to {url}."
             except Exception as e:
-                line = f"Unable to navigate in the selected page: {_nav_reason(e, timeout_s, url)}."
+                if "提示框" in str(e) or "alert" in str(e).lower():
+                    # beforeunload 弹窗挂起导航(DP 以"存在未处理的提示框"拒绝 get):
+                    # 按参数处理——accept 导航继续完成;dismiss 导航被取消,留在原页
+                    action = args.get("handleBeforeUnload") or "accept"
+                    _handle_dialog_action(sess, action)
+                    if action == "dismiss":
+                        line = "Navigation was canceled by beforeunload dialog (dismissed)."
+                    else:
+                        # accept 后原导航在浏览器侧继续提交,立刻重发 navigate 会撞上
+                        # 进行中的导航(ERR_ABORTED)——先等文档落定,已到达目标即成功
+                        try:
+                            t.wait.doc_loaded(nav_timeout)
+                        except Exception:
+                            pass
+                        if (t.url or "").split("#")[0] == url.split("#")[0]:
+                            line = f"Successfully navigated to {url}."
+                        else:
+                            try:
+                                t.get(url, show_errmsg=True, retry=0, timeout=nav_timeout)
+                                line = f"Successfully navigated to {url}."
+                            except Exception as e2:
+                                line = f"Unable to navigate in the selected page: {_nav_reason(e2, timeout_s, url)}."
+                else:
+                    line = f"Unable to navigate in the selected page: {_nav_reason(e, timeout_s, url)}."
         elif typ == "back":
             try:
                 t.back()
@@ -754,7 +785,7 @@ def navigate_page(sess, args, session_dir):
             except Exception as e:
                 line = f"Unable to reload the selected page: {_nav_reason(e)}."
         try:
-            t.wait.doc_loaded(timeout_s or 15)
+            t.wait.doc_loaded(5)  # get 正常返回时 readyState 通常已 complete;预算兜底而非长等
         except Exception:
             pass
         # handleBeforeUnload(cdt 默认 accept):导航触发的 beforeunload 弹窗按参数处理
@@ -1128,8 +1159,22 @@ def list_network_requests(sess, args, session_dir):
     includePreservedRequests=true 返回会话级全缓冲(跨导航,语义超集)。"""
     _ensure_listen(sess)
     packets = []
-    for p in sess.t.listen.steps(timeout=0.5):
-        packets.append(p)
+    # 收割语义 = "排空已捕获积压 + 等新包"。steps 的 timeout 是包间隔语义(每收一包
+    # 重置窗口),持续请求页会永不退出——预算只约束"等新包"(0.5s 总窗 + 0.15s 静默),
+    # 不约束"排空积压"(积压是历史包,排空瞬时完成,砍在这里会把最新的包留在队尾)。
+    queue = getattr(sess.t.listen, "_caught", None)
+    if queue is not None:
+        while True:
+            try:
+                packets.append(queue.get_nowait())
+            except Exception:
+                break
+        deadline = time.perf_counter() + 0.5
+        while time.perf_counter() < deadline:
+            try:
+                packets.append(queue.get(timeout=0.15))
+            except Exception:
+                break  # 0.15s 静默:无新包
     buf = getattr(sess, "_net_buffer", None)
     if buf is None:
         buf = sess._net_buffer = []

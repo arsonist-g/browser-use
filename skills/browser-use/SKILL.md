@@ -47,6 +47,7 @@ browser-use stop --session=<id>
 - **Inspect, then act, then re-inspect.** Get element uids from `take_snapshot`; uids go stale after navigation or SPA DOM rebuilds, so when `click`/`fill` errors, re-run `take_snapshot` and use fresh uids.
 - **Snapshot scrolling hints**: the snapshot annotates each scrollable container (`scroll=... ↓2.3p` = pages below viewport) and counts off-screen interactive elements (`hint:` lines). Scroll to reveal, then re-snapshot.
 - **Incremental capture**: `list_console_messages` and `list_network_requests` return the messages/requests captured **since the previous call** (incremental), each with a stable `msgid`/`reqid`; fetch details with `get_console_message` / `get_network_request`. Call the list tool after the action you care about, not once at the end of a long session, if you need per-step capture.
+- **Downloads**: downloaded files land in the session's `downloads/` directory (they are deleted by `stop` — move files you need out before stopping). To grab a download URL: navigating to the direct link (or clicking a download button) triggers the download; the request shows up in `list_network_requests` when entered via a **direct-link navigation** (its body is `null` — the download stream is not a page response). Requests fired by a **click on a download button** bypass the page's Network events entirely (browser-level download channel) — verify success by the file appearing on disk, not by the request list.
 
 ## Command usage
 
@@ -160,7 +161,7 @@ Every tool command requires `--session=<id>` (the id printed by `start`). The si
 |---|---|---|---|
 | `close_page` | Closes a page. | `<page_id>` | The last open page cannot be closed. |
 | `list_pages` | Lists open pages. | | |
-| `navigate_page` | Navigates: URL, back, forward, reload. | `[url]` `--type` `--ignoreCache` `--timeout` `--initScript` `--handleBeforeUnload` | `url` applies only to `--type url` (the default). |
+| `navigate_page` | Navigates: URL, back, forward, reload. | `[url]` `--type` `--ignoreCache` `--timeout` `--initScript` `--handleBeforeUnload` | `url` applies only to `--type url` (the default). Default URL budget is 20 s (`--timeout` overrides); slow pages return an "Unable to navigate" message rather than hanging. |
 | `new_page` | Opens a new tab. | `<url>` `--background` `--isolatedContext` `--timeout` | Returns the new page id. |
 | `select_page` | Selects the page for future tool calls. | `<page_id>` `--bringToFront` | |
 | `wait_for` | Waits for text to appear. | `<text>` `--timeout` | Searches the main document and all frames. |

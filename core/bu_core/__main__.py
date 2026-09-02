@@ -32,7 +32,8 @@ def main():
 
     sess = BrowserSession(args.session_id, args.port, args.profile,
                           browser_exe=args.browser_exe, headless=args.headless,
-                          attach=args.attach, extra_flags=args.extra_flag)
+                          attach=args.attach, extra_flags=args.extra_flag,
+                          session_dir=args.session_dir)
 
     def log_tool(tool, args_redacted, ok, err=None, dur=0):
         try:

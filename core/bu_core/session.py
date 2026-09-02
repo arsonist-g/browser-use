@@ -3,6 +3,7 @@
 红线(CONSTRAINT-001):不启用 Runtime.enable;不做 UA/平台/语言覆盖。
 """
 import os
+import time
 
 from DrissionPage import Chromium, ChromiumOptions
 
@@ -48,7 +49,7 @@ def install_console_hook(tab):
 
 class BrowserSession:
     def __init__(self, session_id, port, profile, browser_exe=None, headless=False,
-                 attach=False, extra_flags=None):
+                 attach=False, extra_flags=None, session_dir=None):
         self.session_id = session_id
         self.port = port
         self.profile = profile
@@ -57,6 +58,7 @@ class BrowserSession:
         # attach:浏览器已由 daemon 以 pipe+port 双通道启动,DP 只接管(不启动)
         self.attach = attach
         self.extra_flags = extra_flags or []
+        self.session_dir = session_dir
         # WebMCP 需要 flag(运行时特征变更,默认不开 = CONSTRAINT-001 权衡)
         self.webmcp_enabled = "--enable-features=WebMCP" in self.extra_flags
         self.browser = None
@@ -93,6 +95,15 @@ class BrowserSession:
             co.set_argument("--disable-features",
                             "msFirstRunExperience,msSeamlessWebToBrowserSignIn,msImplicitSignin,"
                             "EdgeWelcomePage,EdgeUpdateToast,msEdgeUpdateToast")
+            # 浏览器原生 UI 弹窗治理(与 daemon pipe-browser 的种子同套;此处走 DP
+            # set_pref 写入):翻译/密码/填充/通知。气泡是浏览器 UI,点击工具不可达
+            co.set_argument("--deny-permission-prompts")
+            co.set_pref("translate.enabled", False)
+            co.set_pref("credentials_enable_service", False)
+            co.set_pref("credentials_enable_autosignin", False)
+            co.set_pref("autofill.profile_enabled", False)
+            co.set_pref("autofill.credit_card_enabled", False)
+            co.set_pref("profile.default_content_setting_values.notifications", 2)
             if self.headless:
                 co.headless()
         self.browser = Chromium(co)
@@ -114,6 +125,17 @@ class BrowserSession:
         # 显式 accept/dismiss;自动 accept 会让 handle_dialog 永远无弹窗可处理)
         # console 捕获 hook(每 Page target 注入一次,导航后自动重挂)
         install_console_hook(self.tab)
+        # 下载行为对齐上游(puppeteer/CDT 启动即 allow):headless 新版默认 deny 下载,
+        # 点击 a[download] 会静默丢弃(无网络请求);落会话 downloads 目录(stop 全删口径)
+        if self.session_dir:
+            try:
+                dl_dir = os.path.join(self.session_dir, "downloads")
+                os.makedirs(dl_dir, exist_ok=True)
+                # Chromium 对象只有内部 _run_cdp(public run_cdp 在 tab 上),发 browser 级命令
+                self.browser._run_cdp("Browser.setDownloadBehavior",
+                                      behavior="allow", downloadPath=dl_dir)
+            except Exception:
+                pass
         bv = ""
         try:
             bv = self.tab.run_cdp("Browser.getVersion").get("product", "")
@@ -146,14 +168,21 @@ class BrowserSession:
         return []
 
     def prune_edge_popups(self):
-        """关掉一切浏览器内建页(welcome/同步确认/更新提示等)——它们不是任务页。"""
+        """关掉一切浏览器内建页(welcome/同步确认/更新提示等)——它们不是任务页。
+        不走 DP 的 browser.close_tabs:其内部 `while tab.driver.is_running and ...`
+        依赖 targetDestroyed 事件清理 driver 注册表,事件丢失时无限等待(实测挂死)。"""
         try:
             for t in self.browser.get_tabs():
                 u = (t.url or "").lower()
                 if u.startswith(("edge://", "chrome://", "about:", "edge-netinternal://")):
                     tabs = self.browser.get_tabs()
                     if len(tabs) > 1:
-                        self.browser.close_tabs(t)
+                        tab_id = t.tab_id
+                        self.browser.run_cdp("Target.closeTarget", targetId=tab_id)
+                        for _ in range(40):  # 有界等待 target 消失(≤2s)
+                            if tab_id not in {tb.tab_id for tb in self.browser.get_tabs()}:
+                                break
+                            time.sleep(0.05)
                     else:
                         # 只剩内建页时导航到空白页兜底(不留在欢迎页)
                         t.get("about:blank")

@@ -119,7 +119,9 @@ async function main() {
   const cityUid = parseSnapUid(snap, "combobox") ?? parseSnapUid(snap, '"城市"');
   ok("城市下拉取得 uid(combobox)", !!cityUid);
   if (cityUid) { const r = safeBu("fill 城市", ["fill", "--session", sessionId, cityUid, "bj"]); }
-  const bioUid = parseSnapUid(snap, '"简介"');
+  // textarea 的 AX 名带尾随空格("简介 ")——用 textbox+名前缀匹配,防精确串失配
+  const bioUid = parseSnapUid(snap, 'textbox "简介');
+  ok("简介输入框取得 uid", !!bioUid);
   if (bioUid) { const r = safeBu("fill 简介", ["fill", "--session", sessionId, bioUid, "e2e 简介内容"]); }
   const submitUid = parseSnapUid(snap, "提交表单");
   if (submitUid) { const r = safeBu("click 提交", ["click", "--session", sessionId, submitUid]); }
@@ -127,7 +129,8 @@ async function main() {
   ok("表单提交:name", snap.includes("name=张三"));
   ok("表单提交:city=bj(select)", snap.includes("city=bj"));
   ok("表单提交:agree=True(checkbox)", /agree=True/i.test(snap));
-  ok("表单提交:bio 长度回显", snap.includes("bioLen="));
+  // "e2e 简介内容".length === 8:精确回显长度,bio 未被置值时为 bioLen=0 必红
+  ok("表单提交:bio 长度回显", snap.includes("bioLen=8"));
 
   // ---- 5. 文件上传 ----
   console.log("\n[5] 上传");
@@ -165,10 +168,23 @@ async function main() {
   const tallUid = parseSnapUid(snap, "深滚按钮");
   ok("iframe 内深部按钮取得 uid", !!tallUid);
   if (tallUid) {
+    // 预热:先消费一次 uid(hover)让 scrollIntoViewIfNeeded 的副作用发生在基线
+    // 之前——否则基线采样后工具内部的 scrollIntoView 会污染 delta(审查复审指正)
+    bu(["hover", "--session", sessionId, tallUid]);
+    // 基线:预热后读 [iframe.scrollY, 主文档.scrollY];按钮下方余量 ≥800px
+    // 保证工具滚轮的增量可被单独判别
+    const base = JSON.parse(bu(["evaluate_script", "--session", sessionId,
+      `() => [document.getElementById('scroller').contentWindow.scrollY, window.scrollY]`,
+      "--output-format=json"]));
     const r = JSON.parse(bu(["scroll", "--session", sessionId, "down", "--amount", "400",
       "--uid", tallUid, "--output-format=json"]));
-    ok("iframe 内滚动生效(scrollY>0,主文档不动)", (r.result?.scrollY ?? 0) > 0,
-       `scrollY=${r.result?.scrollY} wheel_used=${r.result?.wheel_used}`);
+    const after = JSON.parse(bu(["evaluate_script", "--session", sessionId,
+      `() => [document.getElementById('scroller').contentWindow.scrollY, window.scrollY]`,
+      "--output-format=json"]));
+    const delta = (after.value?.[0] ?? 0) - (base.value?.[0] ?? 0);
+    ok("iframe 内滚动生效(预热后增量,主文档不动)",
+      delta > 50 && delta < 700 && (after.value?.[1] ?? -1) === 0 && (base.value?.[1] ?? -1) === 0,
+      `scrollY 基线=${base.value?.[0]} → ${after.value?.[0]}(delta=${delta},纯滚轮窗) 主文档=${after.value?.[1]} wheel=${r.result?.wheel_used}`);
   }
 
   // ---- 8. dialog:工具撞上未处理弹窗报错属 blockedByDialog 预期语义(cdt 同);
@@ -181,6 +197,13 @@ async function main() {
   try {
     bu(["click", "--session", sessionId, alertUid]);
   } catch (e) { if (!/未处理|dialog/i.test(e.message)) dialogErr = e.message; }
+  // blockedByDialog 预检腿:弹窗挂起期间,下一个执行类工具必须立即报
+  // "A dialog is open"引导 handle_dialog(而非挂死)——DEC-018 预检路径的真断言
+  let blockedHit = false;
+  try {
+    bu(["evaluate_script", "--session", sessionId, "() => 1"]);
+  } catch (e) { blockedHit = /A dialog is open/i.test(String(e.stdout ?? "") + String(e.stderr ?? "") + e.message); }
+  ok("弹窗挂起时后续工具预检报错(blockedByDialog)", blockedHit);
   try {
     bu(["handle_dialog", "--session", sessionId, "accept"]);
   } catch (e) { dialogErr = (dialogErr ?? "") + " / accept: " + e.message; }
@@ -213,7 +236,10 @@ async function main() {
   bu(["navigate_page", "--session", sessionId, `${BASE}/set-cookie`]);
   bu(["navigate_page", "--session", sessionId, `${BASE}/echo-cookie`]);
   snap = bu(["take_snapshot", "--session", sessionId]);
-  ok("会话 cookie 栈(set→echo 回读 bu_e2e)", snap.includes("bu_e2e="));
+  // 锚定 echo 端点的回显前缀:第二跳导航静默失败时快照停在 set-cookie 页
+  // (其响应体含 "cookie set: bu_e2e=..."),宽断言 bu_e2e= 会假绿——前缀钉死页面
+  ok("会话 cookie 栈(set→echo 回读 bu_e2e)", snap.includes("echo-cookie: bu_e2e="),
+    snap.split("\n").find(l => l.includes("bu_e2e"))?.slice(0, 100));
 
   // ---- 10. iframe:同 host(同进程,主树直含)+ 跨域(OOPIF,per-frame 拼树) ----
   console.log("\n[10] iframe 穿透");
@@ -279,8 +305,8 @@ async function main() {
     ok("中部偏移 iframe 点击命中(inner-clicked)", snap.includes("inner-clicked"),
        "宿主偏移换算缺失——点击落点仍在主视口左上角");
     const offUid2 = parseSnapUid(snap, "偏移子页按钮");
-    try { bu(["take_screenshot", "--session", sessionId, "--uid", offUid2]); ok("中部偏移 iframe 元素截图(clip 宿主链换算)", true); }
-    catch (e) { ok("中部偏移 iframe 元素截图(clip 宿主链换算)", false, e.message.slice(0, 120)); }
+    try { bu(["take_screenshot", "--session", sessionId, "--uid", offUid2]); ok("中部偏移 iframe 元素截图(smoke)", true); }
+    catch (e) { ok("中部偏移 iframe 元素截图(smoke)", false, e.message.slice(0, 120)); }
   }
 
   // ---- 12. stop(完整删除口径:session 目录 + profile 一律不留) ----

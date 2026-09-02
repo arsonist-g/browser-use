@@ -198,16 +198,21 @@ async function main() {
     mark("navigate_page(超时提示行)", r.ok && /Unable to navigate/.test(r.out) && /Navigation timeout/.test(r.out)
       && dt < 15000 ? "PASS" : "FAIL", `${r.out.slice(0, 100)} 耗时=${dt}ms`);
   } catch (e) { mark("navigate_page(超时提示行)", "FAIL", e.message); }
-  // back/forward/reload 成功提示行(上游每型一行;先回主页避免 slow 页拖长 reload)
+  // back/forward/reload:成功提示行必须附带真实 URL/状态——静默 no-op(back 不动
+  // 仍打印 Successfully)靠 URL 变化拆穿:back 回主页后 url 含 /,forward 回 child
   try {
     bu(["navigate_page", "--session", sessionId, `${BASE}/`]);
+    bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]);
     const rb = bu(["navigate_page", "--session", sessionId, "--type", "back"]);
+    const urlBack = JSON.parse(bu(["evaluate_script", "--session", sessionId, "() => location.pathname", "--output-format=json"])).value;
     const rf = bu(["navigate_page", "--session", sessionId, "--type", "forward"]);
+    const urlFwd = JSON.parse(bu(["evaluate_script", "--session", sessionId, "() => location.pathname", "--output-format=json"])).value;
     const rr = bu(["navigate_page", "--session", sessionId, "--type", "reload"]);
-    mark("navigate_page(back/fwd/reload 提示行)", /Successfully navigated back/.test(rb)
-      && /Successfully navigated forward/.test(rf) && /Successfully reloaded/.test(rr) ? "PASS" : "FAIL",
-      `${rb.slice(0, 40)} | ${rf.slice(0, 40)} | ${rr.slice(0, 40)}`);
-  } catch (e) { mark("navigate_page(back/fwd/reload 提示行)", "FAIL", e.message); }
+    mark("navigate_page(back/fwd/reload 提示行+URL 实证)", /Successfully navigated back/.test(rb)
+      && urlBack === "/" && /Successfully navigated forward/.test(rf) && urlFwd === "/child.html"
+      && /Successfully reloaded/.test(rr) ? "PASS" : "FAIL",
+      `back→${urlBack} fwd→${urlFwd}`);
+  } catch (e) { mark("navigate_page(back/fwd/reload 提示行+URL 实证)", "FAIL", e.message); }
   // navigate_page initScript:一次性新文档脚本(cdt 同名参),本导航内生效
   try {
     bu(["navigate_page", "--session", sessionId, `${BASE}/`, "--initScript", "window.__buMarker = 41 + 1;"]);
@@ -216,14 +221,31 @@ async function main() {
   } catch (e) { mark("navigate_page(initScript)", "FAIL", e.message); }
   try { const r = JSON.parse(bu(["new_page", "--session", sessionId, `${BASE}/child.html`, "--output-format=json"]));
         mark("new_page", r.page_id !== undefined && Array.isArray(r.pages) && r.pages.length >= 2 ? "PASS" : "FAIL", `page_id=${r.page_id} pages=${r.pages?.length}`); } catch (e) { mark("new_page", "FAIL", e.message); }
-  try { const r = bu(["list_pages", "--session", sessionId]); mark("list_pages", r.includes("page") ? "PASS" : "FAIL"); } catch (e) { mark("list_pages", "FAIL", e.message); }
-  try { bu(["select_page", "--session", sessionId, "0"]); mark("select_page", "PASS"); } catch (e) { mark("select_page", "FAIL", e.message); }
+  // list_pages:JSON 断言页数与 URL(旧文本断言 includes("page") 是工具字段名子串,
+  // 空列表也绿——形同虚设,审查 FAIL 项)
+  try { const r = JSON.parse(bu(["list_pages", "--session", sessionId, "--output-format=json"]));
+        mark("list_pages", Array.isArray(r.pages) && r.pages.length >= 2
+          && r.pages.every((p) => typeof p.url === "string") ? "PASS" : "FAIL",
+          `pages=${r.pages?.length} urls=${JSON.stringify(r.pages?.map((p) => p.url.slice(-20)))}`); } catch (e) { mark("list_pages", "FAIL", e.message); }
+  // select_page:no-op 拆穿 = 切换后实测 location(select 0 应落在主页 pathname=/)
+  try {
+    bu(["select_page", "--session", sessionId, "0"]);
+    const loc = JSON.parse(bu(["evaluate_script", "--session", sessionId, "() => location.pathname", "--output-format=json"]));
+    mark("select_page", loc.value === "/" ? "PASS" : "FAIL", `切换后 pathname=${loc.value}(期望 /)`);
+  } catch (e) { mark("select_page", "FAIL", e.message); }
   // select_page 越界:文案对齐 cdt getPageById("No page found"),非 IndexError
   try {
     const r = tryBu(["select_page", "--session", sessionId, "999"]);
     mark("select_page(越界文案)", !r.ok && /No page found/.test(r.out) ? "PASS" : "FAIL", r.out.slice(0, 80));
   } catch (e) { mark("select_page(越界文案)", "FAIL", e.message); }
-  try { bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]); bu(["close_page", "--session", sessionId, "1"]); mark("close_page", "PASS"); } catch (e) { mark("close_page", "FAIL", e.message); }
+  // close_page:关后页数实证减一(旧断言纯 no-throw,静默失败不红——审查 FAIL 项)
+  try {
+    bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]);
+    const before = JSON.parse(bu(["list_pages", "--session", sessionId, "--output-format=json"])).pages.length;
+    bu(["close_page", "--session", sessionId, "1"]);
+    const after = JSON.parse(bu(["list_pages", "--session", sessionId, "--output-format=json"])).pages.length;
+    mark("close_page", after === before - 1 ? "PASS" : "FAIL", `pages ${before} → ${after}`);
+  } catch (e) { mark("close_page", "FAIL", e.message); }
   try { bu(["navigate_page", "--session", sessionId, `${BASE}/`]); bu(["wait_for", "--session", sessionId, "BU Fixture 主页"]); mark("wait_for", "PASS"); } catch (e) { mark("wait_for", "FAIL", e.message); }
   // wait_for 跨 frame:目标文本只在 iframe(child.html)内,主文档无(cdt waitForTextOnPage 同语义)
   try {
@@ -333,12 +355,18 @@ async function main() {
     bu(["navigate_page", "--session", sessionId, `${BASE}/child.html`]);
     const j = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--output-format=json"]));
     mark("list_network_requests", (j.requests ?? []).length > 0 ? "PASS" : "FAIL", `requests=${j.requests?.length}`);
-    // resourceTypes 按 CDP ResourceType 过滤:新导航后首次收割应含 document 且全为 document
-    bu(["navigate_page", "--session", sessionId, `${BASE}/`]);
-    const rj = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--output-format=json", "--resourceTypes", "document"]));
-    const allDoc = (rj.requests ?? []).every(q => q.resourceType === "document");
-    mark("list_network_requests(resourceTypes)", (rj.requests ?? []).length > 0 && allDoc ? "PASS" : "FAIL",
-      `n=${rj.requests?.length} 全document=${allDoc}`);
+    // resourceTypes 过滤:/net-types 页自构造混合类型窗(document+fetch+xhr+ping),
+    // 过滤 document 后:结果非空、全为 document、且混合窗本身含非 document(过滤
+    // 真的筛掉了东西)——三条件缺一不可,过滤整个失效也能红(旧断言押注 favicon 偶发)
+    bu(["navigate_page", "--session", sessionId, `${BASE}/net-types`]);
+    await new Promise(r => setTimeout(r, 2000));
+    const mixed = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--includePreservedRequests", "true", "--output-format=json"]));
+    const mixedTypes = new Set((mixed.requests ?? []).map(q => q.resourceType));
+    const rj = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--includePreservedRequests", "true", "--output-format=json", "--resourceTypes", "document"]));
+    const allDoc = (rj.requests ?? []).length > 0 && (rj.requests ?? []).every(q => q.resourceType === "document");
+    const hasNonDoc = [...mixedTypes].some(t => t !== "document");
+    mark("list_network_requests(resourceTypes)", allDoc && hasNonDoc && mixedTypes.has("document") ? "PASS" : "FAIL",
+      `混合窗类型=${[...mixedTypes].join(",")} 过滤后=${rj.requests?.length} 条全document=${allDoc}`);
   } catch (e) { mark("list_network_requests", "FAIL", e.message); }
   try { const r = bu(["get_network_request", "--session", sessionId, "0", "--output-format=json"]);
         const j = JSON.parse(r);
@@ -422,8 +450,15 @@ async function main() {
     mark("lighthouse(viewport 复原)", JSON.stringify(vpBefore) === JSON.stringify(vpAfter) ? "PASS" : "FAIL",
       `before=${JSON.stringify(vpBefore)} after=${JSON.stringify(vpAfter)}`);
   } catch (e) {
-    const msg = e.message ?? "";
-    mark("lighthouse_audit", /lighthouse|npx|ENOTFOUND|not installed/i.test(msg) ? "SKIP" : "FAIL", msg.slice(0, 140));
+    // SKIP 仅限环境依赖缺失(探测走与工具相同的 npx --yes 通道,首装需联网给 90s;
+    // --no-install 在 npm 7+ 非受支持标志,静默行为不可靠——审查指正)。旧正则
+    // /lighthouse|npx/i 会命中工具自身命令行把执行失败全吞成 SKIP——永绿僵尸。
+    const msg = String(e.message ?? "");
+    let depMissing = false;
+    try { execFileSync("npx", ["--yes", "lighthouse", "--version"], { encoding: "utf8", timeout: 90000, shell: true }); }
+    catch { depMissing = true; }
+    mark("lighthouse_audit", depMissing ? "SKIP" : "FAIL",
+      depMissing ? "lighthouse 不可得(npx 探测失败,外部依赖)" : msg.slice(0, 140));
     mark("lighthouse(viewport 复原)", "SKIP", "依赖 lighthouse_audit 成功");
   }
   try { const r = bu(["take_screenshot", "--session", sessionId]); mark("take_screenshot", r.includes("path") ? "PASS" : "FAIL"); } catch (e) { mark("take_screenshot", "FAIL", e.message); }
@@ -494,19 +529,39 @@ async function main() {
       const ok = (r.edges ?? []).length > 0 && r.edges.every(e => typeof e.nodeId === "number" && typeof e.retained_size === "number");
       mark("get_heapsnapshot_edges", ok ? "PASS" : "FAIL", `edges=${r.edges?.length}`);
     } catch (e) { mark("get_heapsnapshot_edges", "FAIL", e.message); }
+    // 反向图断言用"必有保留者"的 System 对象节点(nodeId=1 是根对象,retainers
+    // 天然为空,反向索引建空的实现性坏与真好不可区分——审查 FAIL 项)。
+    // 包 try:单点异常不得弃掉矩阵后半(harness 健壮性,复审建议)
+    let sysId = null;
     try {
-      const r = J(["get_heapsnapshot_retainers", ...HS, "--output-format=json", "--nodeId", "1"]);
-      mark("get_heapsnapshot_retainers", Array.isArray(r.retainers) && typeof r.retainer_count === "number" ? "PASS" : "FAIL", `count=${r.retainer_count}`);
+      const sysQ = J(["query_heapsnapshot_objects", ...HS, "--output-format=json", "--className", "System", "--pageSize", "5"]);
+      sysId = (sysQ.objects ?? []).find(o => typeof o.nodeId === "number")?.nodeId;
+    } catch (e) { mark("query(System 节点选取)", "FAIL", e.message); }
+    if (sysId === null) {
+      mark("get_heapsnapshot_retainers", "FAIL", "System 节点未取得");
+      mark("get_heapsnapshot_retaining_paths", "FAIL", "同上");
+      mark("get_heapsnapshot_object_details", "FAIL", "同上");
+    }
+    if (sysId !== null) {
+    try {
+      const r = J(["get_heapsnapshot_retainers", ...HS, "--output-format=json", "--nodeId", String(sysId)]);
+      mark("get_heapsnapshot_retainers", (r.retainers ?? []).length > 0 && r.retainer_count > 0 ? "PASS" : "FAIL",
+        `node=${sysId} retainers=${r.retainer_count}(System 对象必有保留者)`);
     } catch (e) { mark("get_heapsnapshot_retainers", "FAIL", e.message); }
     try {
-      const r = J(["get_heapsnapshot_retaining_paths", ...HS, "--output-format=json", "--nodeId", "1"]);
-      const p0 = (r.paths ?? [])[0];
-      const toRoot = (p0?.chain ?? []).some(c => c.type === "Root" || c.type === "Synthetic");
-      // 有链:链必须真实(含 Root/Synthetic);无链:对齐 cdt 返回空 + 提示行(不伪造路径)
-      const withPaths = (r.paths ?? []).length > 0 && (toRoot || p0.chain.length >= 1);
-      const emptyOk = (r.paths ?? []).length === 0 && typeof r.note === "string";
-      mark("get_heapsnapshot_retaining_paths", withPaths || emptyOk ? "PASS" : "FAIL",
-        `paths=${r.paths?.length} 首链深=${p0?.depth} note=${r.note ?? "-"}`);
+      const r = J(["get_heapsnapshot_retaining_paths", ...HS, "--output-format=json", "--nodeId", String(sysId)]);
+      const chains = r.paths ?? [];
+      // 真条件:保留链非空且链顶到达根——root/synthetic 类型节点(V8 快照 type
+      // 为小写字面量;大写比较是死分支,复审指正),或图源节点名((global)/(roots)
+      // 等无保留者;实现 BFS 对两类都终止)
+      const topOk = (p) => {
+        const top = (p.chain ?? [])[(p.chain ?? []).length - 1] ?? {};
+        return ["root", "synthetic"].includes(String(top.type).toLowerCase())
+          || /global|root|synthetic|native context/i.test(String(top.name ?? ""));
+      };
+      const okPaths = chains.length > 0 && chains.every((p) => (p.chain ?? []).length > 0 && topOk(p));
+      mark("get_heapsnapshot_retaining_paths", okPaths ? "PASS" : "FAIL",
+        `paths=${chains.length} 首链深=${chains[0]?.chain?.length} 顶=${(chains[0]?.chain ?? []).slice(-1)[0]?.name}`);
     } catch (e) { mark("get_heapsnapshot_retaining_paths", "FAIL", e.message); }
     try {
       const r = J(["get_heapsnapshot_dominators", ...HS, "--output-format=json", "--nodeId", "1"], 240000);
@@ -517,10 +572,13 @@ async function main() {
       mark("get_heapsnapshot_dominators", reachesRoot ? "PASS" : "FAIL", `链长=${chain.length} 顶=${top?.type}`);
     } catch (e) { mark("get_heapsnapshot_dominators", "FAIL", e.message); }
     try {
-      const r = J(["get_heapsnapshot_object_details", ...HS, "--output-format=json", "--nodeId", "1"], 240000);
-      mark("get_heapsnapshot_object_details", typeof r.node?.self_size === "number" && typeof r.distance === "number"
-        && "out_edges_sample" in r ? "PASS" : "FAIL", `distance=${r.distance}`);
+      const r = J(["get_heapsnapshot_object_details", ...HS, "--output-format=json", "--nodeId", String(sysId)], 240000);
+      // 内容下限(旧三个 typeof 纯形状断言换成可失败的语义锚——审查 FAIL 项)
+      mark("get_heapsnapshot_object_details", (r.node?.self_size ?? -1) >= 0 && (r.distance ?? -1) >= 0
+        && Array.isArray(r.out_edges_sample) ? "PASS" : "FAIL",
+        `self_size=${r.node?.self_size} distance=${r.distance} 出边采样=${r.out_edges_sample?.length}`);
     } catch (e) { mark("get_heapsnapshot_object_details", "FAIL", e.message); }
+    }  // end if (sysId !== null)
     try {
       const r = J(["query_heapsnapshot_objects", ...HS, "--output-format=json", "--className", "System", "--pageSize", "10"]);
       const allSys = (r.objects ?? []).every(o => o.name.includes("System"));
@@ -595,16 +653,35 @@ async function main() {
   try {
     const wout = bu(["start", "--headless", "--extra-flags", JSON.stringify(["--enable-features=WebMCP"])]);
     webSession = (wout.match(/session=(\S+)/) ?? [])[1];
-    bu(["navigate_page", "--session", webSession, `${BASE}/`]); // fixture 防御式注册 get-fixture-title
-    const r = JSON.parse(bu(["list_webmcp_tools", "--session", webSession, "--output-format=json"]));
-    const has = (r.tools ?? []).some(t => t.name === "get-fixture-title");
-    mark("list_webmcp_tools", has ? "PASS" : "FAIL", JSON.stringify(r).slice(0, 140));
-    const r2 = JSON.parse(bu(["execute_webmcp_tool", "--session", webSession, "get-fixture-title", "--output-format=json"]));
-    mark("execute_webmcp_tool", r2.status === "Completed" && (r2.output ?? "").includes("BU Fixture") ? "PASS" : "FAIL",
-      JSON.stringify(r2).slice(0, 140));
   } catch (e) {
-    mark("list_webmcp_tools", /WebMCP|flag/i.test(e.message) ? "SKIP" : "FAIL", e.message.slice(0, 140));
-    mark("execute_webmcp_tool", "SKIP", "同 list_webmcp_tools");
+    mark("list_webmcp_tools", "SKIP", `专用会话启动失败(环境): ${String(e.stdout || e.message).slice(0, 100)}`);
+    mark("execute_webmcp_tool", "SKIP", "同上");
+  }
+  if (webSession) try {
+    bu(["navigate_page", "--session", webSession, `${BASE}/`]); // fixture 防御式注册 get-fixture-title
+    let listOk = false;
+    try {
+      const r = JSON.parse(bu(["list_webmcp_tools", "--session", webSession, "--output-format=json"]));
+      listOk = (r.tools ?? []).some(t => t.name === "get-fixture-title");
+      mark("list_webmcp_tools", listOk ? "PASS" : "FAIL", JSON.stringify(r).slice(0, 140));
+    } catch (e) {
+      // flag 未生效/域不可达 = 环境类;list 自身失败不再连带改写 execute 的标记
+      mark("list_webmcp_tools", /WebMCP|flag|timed out|not found/i.test(String(e.stdout ?? e.message)) ? "SKIP" : "FAIL",
+        String(e.stdout ?? e.message).slice(0, 140));
+    }
+    if (listOk) {
+      // list 已证环境可用:execute 一切失败都是工具域 → FAIL(旧 catch 把执行异常
+      // 吞成 SKIP 且反向污染 list 标记——laundering,审查 FAIL 项)
+      try {
+        const r2 = JSON.parse(bu(["execute_webmcp_tool", "--session", webSession, "get-fixture-title", "--output-format=json"]));
+        mark("execute_webmcp_tool", r2.status === "Completed" && (r2.output ?? "").includes("BU Fixture") ? "PASS" : "FAIL",
+          JSON.stringify(r2).slice(0, 140));
+      } catch (e) {
+        mark("execute_webmcp_tool", "FAIL", String(e.stdout ?? e.message).slice(0, 140));
+      }
+    } else {
+      mark("execute_webmcp_tool", "SKIP", "list_webmcp_tools 未通过(环境)");
+    }
   } finally {
     if (webSession) { try { bu(["stop", "--session", webSession]); } catch { /* */ } }
   }
@@ -627,22 +704,28 @@ async function main() {
       const cout = bu(["start", "--browser-exe", chromeExe]);
       const csid = (cout.match(/session=(\S+)/) ?? [])[1];
       bu(["install_pwa", "--session", csid, "--manifestId", manifestId, "--installUrlOrBundleUrl", `${BASE}/pwa.html`]);
-      bu(["launch_pwa", "--session", csid, "--manifestId", manifestId]);
-      mark("launch_pwa", "PASS", "Chrome 复核(Edge 152 域级拒绝,实测已声明)");
+      // 内容锚:launch 必须真实返回 launched 且 url 为 manifest start_url
+      const lr = JSON.parse(bu(["launch_pwa", "--session", csid, "--manifestId", manifestId, "--output-format=json"]));
+      const launchedOk = lr.launched === true && typeof lr.url === "string" && lr.url.startsWith(BASE);
+      mark("launch_pwa", launchedOk ? "PASS" : "FAIL",
+        `launched=${lr.launched} url=${lr.url}(Chrome 复核;Edge 152 域级拒绝已声明)`);
       try { bu(["uninstall_pwa", "--session", csid, "--manifestId", manifestId]); } catch { /* */ }
       bu(["stop", "--session", csid]);
     } catch (e2) {
-      mark("launch_pwa", "SKIP", `Chrome 复核失败: ${e2.message.slice(0, 100)}`);
+      // 有 Chrome = 环境满足,执行失败是工具域 → FAIL(旧写法吞成 SKIP 无 FAIL 路径)
+      mark("launch_pwa", "FAIL", `Chrome 复核执行失败: ${String(e2.stdout ?? e2.message).slice(0, 120)}`);
     }
   } else {
     mark("launch_pwa", "SKIP", "Edge 152 域级拒绝 PWA.launch(实测,已声明);本机无 Chrome 可复核");
   }
   try {
     bu(["uninstall_pwa", "--session", sessionId, "--manifestId", manifestId]);
-    let gone = false;
+    let goneMsg = null;
     try { bu(["get_os_app_state", "--session", sessionId, "--manifestId", manifestId]); }
-    catch { gone = true; } // 卸载后查询应报 Unknown web-app manifest id
-    mark("uninstall_pwa", gone ? "PASS" : "FAIL", "卸载后状态仍可查");
+    catch (e2) { goneMsg = String(e2.stdout || e2.stderr || e2.message); } // 卸载后查询应报错
+    // 文案匹配(旧写法任意异常都算 gone,会话抖动也假绿——审查 FAIL 项)
+    mark("uninstall_pwa", goneMsg && /Unknown web-app manifest id/i.test(goneMsg) ? "PASS" : "FAIL",
+      goneMsg ? goneMsg.slice(0, 100) : "卸载后状态仍可查");
   } catch (e) { mark("uninstall_pwa", "FAIL", e.message.slice(0, 120)); }
 
   // ========== 选中页关闭语义(cdt 同:page 工具报错引导 list_pages;list_pages 自动回退 + 提示行) ==========

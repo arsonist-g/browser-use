@@ -367,10 +367,14 @@ def get_heapsnapshot_retaining_paths(sess, args, session_dir):
                     continue
                 seen.add(p)
                 npath = [{"nodeId": p, "name": hs.nodes[p]["name"], "type": hs.nodes[p]["type"]}] + path
-                if hs.nodes[p]["type"] in ("Root", "Synthetic"):
+                # 终止:synthetic/shortcut 类节点,或无保留者的图源(V8 快照保留链顶
+                # 常是 (global)/Window 等 object 类型——只认 synthetic 会令正常链
+                # 永远返回空,实测 paths=0 而 retainers 非空;type 为小写字面量)
+                if str(hs.nodes[p]["type"]).lower() in ("root", "synthetic") or not preds.get(p):
                     paths.append({"depth": len(npath), "chain": npath})
                     if len(paths) >= max_nodes:
                         return {"paths": paths}
+                    continue
                 nxt.append((p, npath))
         frontier = nxt
         depth += 1

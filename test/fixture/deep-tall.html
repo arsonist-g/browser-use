@@ -6,5 +6,8 @@
 <div style="height:1600px">长内容占位</div>
 <button id="tall-btn" onclick="document.getElementById('tall-log').textContent='tall-clicked'">深滚按钮</button>
 <div id="tall-log">(tall 未点击)</div>
+<!-- 按钮下方余量:scrollIntoViewIfNeeded 把按钮带入视口后仍需 ≥400px 可滚,
+     使滚轮增量可被单独判别(不与 scrollIntoView 的副作用混同) -->
+<div style="height:800px">底部余量</div>
 </body>
 </html>

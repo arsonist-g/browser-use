@@ -127,13 +127,23 @@ def performance_analyze_insight(sess, args, session_dir):
     with open(fp, encoding="utf-8") as f:
         trace = json.load(f)
     ev = trace.get("traceEvents", [])
-    long_tasks, layout_shifts, lcp_best = [], [], 0.0
+    layout_shifts, lcp_best = [], 0.0
     net_requests = 0
+    # 长任务:>50ms 的顶层任务。一次主线程阻塞会产生嵌套事件链
+    # (RunTask > FunctionCall/EvaluateScript > v8.run/ParseHTML,实测 Edge 152 无 RunTask
+    # 时 EvaluateScript/v8.run/ParseHTML 直接顶层),按 dur 降序挑最外层、跳过区间被
+    # 已选事件包含的嵌套项,避免同一次阻塞被数多次
+    long_ev = [e for e in ev if e.get("dur", 0) / 1000.0 > 50]
+    long_ev.sort(key=lambda e: -e.get("dur", 0))
+    picked = []
+    for e in long_ev:
+        s, d = e.get("ts", 0), e.get("dur", 0)
+        if any(s >= ps and s + d <= ps + pd for ps, pd in picked):
+            continue
+        picked.append((s, d))
+    long_tasks = [round(pd / 1000.0, 1) for _, pd in picked]
     for e in ev:
         name = e.get("name", "")
-        dur = e.get("dur", 0) / 1000.0
-        if name in ("RunTask", "ThreadControllerImpl::RunTask") and dur > 50:
-            long_tasks.append(round(dur, 1))
         if name == "LayoutShift":
             layout_shifts.append(e)
         if name in ("largestContentfulPaint::Candidate", "LargestContentfulPaint::Candidate"):
@@ -143,8 +153,10 @@ def performance_analyze_insight(sess, args, session_dir):
             net_requests += 1
     lcp_ms = None
     if lcp_best and ev:
-        t0 = min(e.get("ts", 0) for e in ev)
-        lcp_ms = round((lcp_best - t0) / 1000.0, 1)
+        # 无 ts 的 metadata 事件(默认 0)会把基准拉到 0 → LCP 变成绝对时间戳;排除之
+        ts_all = [e.get("ts", 0) for e in ev if e.get("ts", 0) > 0]
+        if ts_all:
+            lcp_ms = round((lcp_best - min(ts_all)) / 1000.0, 1)
     insights = {
         "long_tasks_over_50ms": len(long_tasks),
         "long_tasks_ms_top10": sorted(long_tasks, reverse=True)[:10],
