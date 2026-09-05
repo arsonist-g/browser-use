@@ -77,7 +77,7 @@ browser-use <tool> --session=<id> [required positionals] [--optional-flags]
 | PWA | get_os_app_state, install_pwa, launch_pwa, uninstall_pwa |
 | Extensions | install_extension, list_extensions, reload_extension, trigger_extension_action, uninstall_extension |
 
-Plus session commands: `start`, `stop`, `sessions list|clean`, `session.bare`, `status`, `config`, `extension`, `doctor`.
+Plus session commands: `start`, `stop`, `sessions list|clean`, `session.bare`, `status`, `config`, `extension`, `allow`, `doctor`.
 
 The **Tool reference** section at the end of this file maps every tool to its parameters and command-specific notes; `browser-use help <tool>` prints the full per-parameter reference (types, accepted values, defaults) at runtime.
 
@@ -267,4 +267,5 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 | `config get/set/list/reset` | | |
 | `extension` | | Prints the bridge extension directory. |
 | `skill list/install/uninstall` | `--agent=<key>` `--all` `--force` `--dry-run` | Installs this skill into coding agents. |
+| `allow` | `--agent=<key>` `--all` `--remove` `--dry-run` | Pre-approves `browser-use` commands in coding agents (approval allowlists), so agent sessions stop asking per command. Default agent `claude-code`; agents whose config isn't detected (e.g. no Windsurf install) are skipped with a hint. |
 | `doctor` | `[--fix]` | Checks node, python, core, and Edge. |

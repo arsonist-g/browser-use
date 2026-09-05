@@ -56,6 +56,29 @@ Supported agents and their skill directories (each verified against the vendor's
 
 Codex, Cursor, Gemini CLI, and Windsurf also read the cross-vendor `~/.agents/skills/` directory; the installer writes each agent's own directory so every one can be installed and removed independently. Restart the agent after installing so it picks up the skill.
 
+## Skip per-command approval
+
+Agents ask before every shell command, which makes browser-use sessions slow. Pre-approve the `browser-use` command once:
+
+```sh
+browser-use allow                     # Claude Code: adds Bash(browser-use:*) to ~/.claude/settings.json
+browser-use allow --agent=cursor      # any supported agent key, or --all
+browser-use allow --all --dry-run     # preview; --remove undoes
+```
+
+Supported agents and what gets written (each mechanism verified against the vendor's docs):
+
+| Agent | Config written |
+|---|---|
+| Claude Code | `~/.claude/settings.json` → `permissions.allow: ["Bash(browser-use:*)"]` |
+| Codex CLI | `~/.codex/rules/browser-use.rules` (prefix_rule allow) |
+| Cursor (IDE + CLI) | `~/.cursor/permissions.json` → `terminalAllowlist`; `~/.cursor/cli-config.json` → `permissions.allow` |
+| Gemini CLI | `~/.gemini/policies/browser-use.toml` (policy rule allow) |
+| Windsurf | Windsurf user `settings.json` → `windsurf.cascadeCommandsAllowList` (only when a Windsurf install is detected) |
+| opencode | `~/.config/opencode/opencode.json` → `permission.bash` allow entries |
+
+Merges are idempotent and preserve existing entries; `--remove` deletes only this tool's rules (emptied files/keys are cleaned up). Cursor note: once `permissions.json` defines `terminalAllowlist`, it replaces the in-app allowlist (the command prints a warning).
+
 ## Tool surface
 
 Full chrome-devtools-mcp v1.8.0 parity: interaction (click/fill/drag/type/scroll/dialogs), navigation and pages, snapshots and screenshots, `evaluate_script`, console and network with harvest semantics, emulation, performance tracing, 13 heapsnapshot/memory tools, Lighthouse audit, screencast, third-party devtools tools, WebMCP, PWA management, in-session extension management. `browser-use --help` lists session commands; tools run as `browser-use <tool> --session=<id> [args]`.

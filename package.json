@@ -1,6 +1,6 @@
 {
   "name": "@arsonist-g/browser-use",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "AI browser automation driven by the machine's daily browser: session-scoped cookie injection, DrissionPage core, dedicated bridge. CLI bin: browser-use",
   "license": "MIT",
   "repository": {
@@ -31,7 +31,7 @@
   "scripts": {
     "start": "node bin/browser-use.mjs",
     "lint:py": "python -m ruff check core/bu_core",
-    "test": "npm run lint:py && node --test test/unit/core.test.mjs test/unit/skills.test.mjs test/unit/tool-help.test.mjs",
+    "test": "npm run lint:py && node --test test/unit/core.test.mjs test/unit/skills.test.mjs test/unit/tool-help.test.mjs test/unit/permissions.test.mjs",
     "e2e": "node test/e2e.mjs",
     "all-tools": "node test/all-tools.mjs"
   }

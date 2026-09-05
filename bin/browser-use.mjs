@@ -116,7 +116,7 @@ async function main() {
   const argv = process.argv.slice(2);
   // 通用解析:--flag value / --boolFlag / 位置参数(工具参数各异,不再逐一声明)
   const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
-    "headless", "bringToFront", "fix", "dry-run", "force"]);
+    "headless", "bringToFront", "fix", "dry-run", "force", "remove"]);
   const values = {};   // flags
   const positionals = [];
   for (let i = 1; i < argv.length; i++) {
@@ -145,6 +145,7 @@ usage:
   browser-use config get [k] | set <k> <v> | list | reset [k]
   browser-use extension          # 打印桥扩展目录与配对 token
   browser-use skill list | install --agent=<key>|--all [--force] [--dry-run] | uninstall --agent=<key>
+  browser-use allow [--agent=<key>|--all] [--remove] [--dry-run]  # 放行 browser-use 命令(免逐次审批)
   browser-use doctor [--fix]
   browser-use help <tool>        # 查看某工具的全部参数;browser-use help 列出全部工具
 参数报错时: 先 browser-use help <tool> 核对签名,再重试。`);
@@ -160,7 +161,7 @@ usage:
   if (command === "help") return out(helpOverviewText());
   if (values.help) {
     if (toolHelpText(command)) return out(toolHelpText(command));
-    const sessionCmds = new Set(["start", "stop", "sessions", "session.bare", "status", "config", "extension", "skill", "doctor"]);
+    const sessionCmds = new Set(["start", "stop", "sessions", "session.bare", "status", "config", "extension", "skill", "allow", "doctor"]);
     if (sessionCmds.has(command)) return out(helpOverviewText());
     die(2, `未知工具: ${command}(browser-use help 列出全部工具)`);
   }
@@ -269,6 +270,50 @@ usage:
           return out(results.map((r) => `${r.removed ? "removed" : "not present"} ${r.agent}: ${r.dir}`).join("\n"));
         }
         return die(2, `用法: browser-use skill list | install --agent=<key>|--all [--force] [--dry-run] | uninstall --agent=<key>`);
+      }
+      case "allow": {
+        // 放行规则写入 agent 配置文件(本地操作,不经 daemon);一 agent 多站点逐站点输出
+        const { ALLOW_TARGETS, allowStatus, addAllow, removeAllow }
+          = await import("../lib/permissions.mjs");
+        const home = (await import("node:os")).homedir();
+        const remove = !!values.remove;
+        const dryRun = !!values["dry-run"];
+        const agentAll = values.agent === "all" || !!values.all;   // --agent=all 或裸 --all
+        const requested = agentAll ? ALLOW_TARGETS.map((t) => t.key)
+          : !values.agent ? ["claude-code"]   // 优先平台:缺省 claude-code
+          : [values.agent];
+        if (values.agent && !agentAll && !ALLOW_TARGETS.some((t) => t.key === values.agent))
+          die(2, `未知 agent: ${values.agent}(valid: ${ALLOW_TARGETS.map((t) => t.key).join(", ")}, all)`);
+        const results = [];
+        for (const key of requested) {
+          if (dryRun) results.push(allowStatus(key, home));
+          else results.push(remove ? removeAllow(key, home) : addAllow(key, home));
+        }
+        if (jsonMode) return outJson({ results });
+        for (const r of results) {
+          for (const s of r.sites) {
+            const tag = `${r.agent} ${s.file}`;
+            if (s.error) { errOut(`error[INVALID_ARG]: ${tag}: ${s.error}\n`); continue; }
+            if (s.skipped) { out(`skipped ${tag} — ${s.hint ?? ""}`); continue; }
+            if (dryRun) {
+              out(`[dry-run] ${tag}(${s.state})`);
+              if (s.hint) out(`hint: ${s.hint}`);
+              continue;
+            }
+            if (remove) {
+              if (s.changed) out(s.removed === true || s.fileDeleted
+                ? `removed ${tag}(file deleted)` : `removed ${tag}(${(s.removed ?? []).join(", ")})`);
+              else out(`not present ${tag}`);
+            } else {
+              if (s.changed && s.created) out(`allowed ${tag}(file created)`);
+              else if (s.changed) out(`allowed ${tag}(added: ${(s.added ?? []).join(", ")})`);
+              else out(`already allowed ${tag}`);
+            }
+            if (s.warning) out(`warning ${r.agent}: ${s.warning}`);
+          }
+        }
+        if (results.some((r) => r.sites.some((s) => s.error))) process.exitCode = 2;
+        return;
       }
       case "doctor": {
         return cmdDoctor(values.fix, jsonMode);

@@ -56,6 +56,29 @@ browser-use skill install --all [--dry-run]       # 全部支持的 agent;--dry-
 
 Codex、Cursor、Gemini CLI、Windsurf 同时也读取跨厂商目录 `~/.agents/skills/`;安装器按各家专属目录写入,使每个 agent 可独立安装与卸载。安装后重启 agent 使 skill 生效。
 
+## 免逐次审批(命令放行)
+
+agent 对每条 shell 命令逐次询问,会让 browser-use 会话很慢。放行一次,后续调用不再询问:
+
+```sh
+browser-use allow                     # Claude Code:向 ~/.claude/settings.json 追加 Bash(browser-use:*)
+browser-use allow --agent=cursor      # 指定 agent key,或 --all 全部
+browser-use allow --all --dry-run     # 预览;--remove 撤销
+```
+
+支持的 agent 与写入内容(每项机制均经官方文档核实):
+
+| Agent | 写入位置 |
+|---|---|
+| Claude Code | `~/.claude/settings.json` → `permissions.allow: ["Bash(browser-use:*)"]` |
+| Codex CLI | `~/.codex/rules/browser-use.rules`(prefix_rule allow) |
+| Cursor(IDE + CLI) | `~/.cursor/permissions.json` → `terminalAllowlist`;`~/.cursor/cli-config.json` → `permissions.allow` |
+| Gemini CLI | `~/.gemini/policies/browser-use.toml`(策略规则 allow) |
+| Windsurf | Windsurf 用户 `settings.json` → `windsurf.cascadeCommandsAllowList`(仅当检测到已安装的 Windsurf) |
+| opencode | `~/.config/opencode/opencode.json` → `permission.bash` 放行键 |
+
+写入幂等、保留既有条目;`--remove` 只删本工具的规则(剪空后文件/键一并清理)。Cursor 注意:一旦 `permissions.json` 定义 `terminalAllowlist`,设置 UI 里的终端允许列表被该文件整体取代(命令会打印警告)。
+
 ## 工具面
 
 与 chrome-devtools-mcp v1.8.0 完全对齐:交互(click/fill/drag/type/scroll/对话框)、导航与页面、快照与截图、`evaluate_script`、收割语义的 console 与 network、仿真、性能追踪、13 件 heapsnapshot/内存工具、Lighthouse 审计、录屏、三方 devtools 工具、WebMCP、PWA 管理、会话内扩展管理。`browser-use --help` 列出会话命令;工具以 `browser-use <tool> --session=<id> [args]` 调用。

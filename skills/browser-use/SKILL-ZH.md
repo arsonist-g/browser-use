@@ -268,4 +268,5 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 | `config get/set/list/reset` | | |
 | `extension` | | Prints the bridge extension directory. |
 | `skill list/install/uninstall` | `--agent=<key>` `--all` `--force` `--dry-run` | Installs this skill into coding agents. |
+| `allow` | `--agent=<key>` `--all` `--remove` `--dry-run` | Pre-approves `browser-use` commands in coding agents (approval allowlists), so agent sessions stop asking per command. Default agent `claude-code`; agents whose config isn't detected (e.g. no Windsurf install) are skipped with a hint. |
 | `doctor` | `[--fix]` | Checks node, python, core, and Edge. |
