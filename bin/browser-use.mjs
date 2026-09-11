@@ -183,6 +183,7 @@ usage:
         out(`session=${r.session_id}`);
         if (r.login_state === "injected") out("login=injected(登录态已注入)");
         else out(`login=${r.login_state}\n提示: 未取得登录态。若任务需要登录:确认日常浏览器已打开、扩展已配对(popup 显示已连接);若不需要:browser-use session.bare --session=${r.session_id} 跳过。`);
+        if (r.warning) out(`warning: ${r.warning}`);
         return;
       }
       case "session.bare": {

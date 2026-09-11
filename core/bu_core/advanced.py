@@ -2,18 +2,20 @@
 """Screencast(Page.startScreencast 事件收帧)/ click_at / Third-party / WebMCP /
 PWA / extensions / lighthouse_audit(外部 CLI attach)。
 
-PWA 与 Extensions 域仅在 pipe 通道可达(ws 上实测 "wasn't found"/域失效):daemon 以
---remote-debugging-pipe 自托管浏览器进程并经 HTTP /pipe/cdp 转发;core 走该端点。
+PWA 与 Extensions 域不共用一个通道(实测):Extensions 由 target 层级门控,浏览器级
+ws 上可用(page 级报 Method not available);PWA 需要 AllowUnsafeOperations,只有 pipe
+通道给。daemon 以 --remote-debugging-pipe 自托管浏览器进程并经 HTTP /pipe/cdp 转发,
+由 daemon 按域名分流;core 只认这一个端点。
 """
 import base64
 import json
 import os
 import time
 
-# ---- pipe 通道(daemon 托管浏览器进程的 pipe CDP;PWA/extensions 专用) ----
+# ---- 浏览器级 CDP 通道(经 daemon /pipe/cdp 转发;Extensions 走 ws、PWA 走 pipe) ----
 
 def _pipe_call(sess, method, timeout=30, **params):
-    """经 daemon 的 /pipe/cdp 端点调 pipe 通道 CDP(浏览器 fd3/4 直连)。"""
+    """经 daemon 的 /pipe/cdp 端点调浏览器级 CDP(daemon 按域名选 ws 或 pipe)。"""
     from .cdp_events import pipe_call
     return pipe_call(sess.session_id, method, timeout=timeout, **params)
 
