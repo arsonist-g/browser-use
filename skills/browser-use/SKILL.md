@@ -21,7 +21,7 @@ Imperative sentences are rules you must follow. Code blocks are command examples
 
 ## Sessions: one session per task, `--session=<id>` on every command
 
-1. **Start**: `browser-use start` (add `--headless` for background work). It injects login cookies and launches an isolated Edge, then prints `session=<id>`. **Read that id** and pass it on every later command. You cannot choose it. Each session is a separate Edge instance, so concurrent AI windows never share a browser.
+1. **Start**: `browser-use start`. It injects login cookies and launches an isolated Edge - always headed, since headless launch is disabled (see Red lines) - then prints `session=<id>`. **Read that id** and pass it on every later command. You cannot choose it. Each session is a separate Edge instance, so concurrent AI windows never share a browser.
 2. **Work**: run tools against the session (see AI workflow).
 3. **Stop**: when done, `browser-use stop --session=<id>`. It closes the Edge and deletes the session's data entirely — the one-off profile, artifacts (screenshots, traces, snapshots), and the session record. Nothing is kept after stop; save anything you need out of the session before stopping. Always stop your sessions; do not leave browsers running behind you.
 
@@ -96,6 +96,7 @@ The **Tool reference** section at the end of this file maps every tool to its pa
 
 - **No fingerprint overrides.** User agent, platform, and language overrides are deliberately disabled; `emulate` refuses them. Anti-bot systems cross-check these against TLS and behavioral signals, and a mismatch is itself a detection signal. Do not work around this.
 - **Stay on the machine's real Edge.** Do not point `--browser-exe` at another browser and expect the same anti-detection behavior.
+- **Headed only.** Never look for a way to run this browser headless: the `--headless` flag was removed and the CLI rejects it. The headless form was never tested against anti-bot systems, and headless detection is far harder to defeat than headed, so a headless session is unsupported - not a faster option.
 - **One task, one session.** Start, work, `stop`. Sessions hold a full copy of the user's cookies: do not hand session ids between tasks, and stop them as soon as the task ends.
 
 
@@ -259,7 +260,7 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 
 | Command | Parameters | Notes |
 |---|---|---|
-| `start` | `--headless` `--browser-exe` `--extra-flags` | The only command without `--session`; prints `session=<id>`. |
+| `start` | `--browser-exe` `--extra-flags` | The only command without `--session`; prints `session=<id>`. Always headed: `--headless` was removed and is rejected. |
 | `stop` | `--session=<id>` | Closes the browser and deletes the session directory entirely (profile, artifacts, logs). |
 | `sessions list` / `sessions clean` | `[--state=<s>]` | `clean` reaps non-live sessions and deletes their data entirely. |
 | `session.bare` | `--session=<id>` | Skips login-state injection. |

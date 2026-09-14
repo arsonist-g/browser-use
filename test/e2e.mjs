@@ -14,6 +14,8 @@ const CLI = path.join(ROOT, "bin", "browser-use.mjs");
 const FIXTURE_PORT = 18123;
 const BASE = `http://127.0.0.1:${FIXTURE_PORT}`;
 const HEADED = process.argv.includes("--headed");
+// 无头启动已从 CLI 移除(反检测红线):测试进程经本环境变量显式放行,无头只作补充形态
+if (!HEADED) process.env.BU_DEV_ALLOW_HEADLESS = "1";
 
 let pass = 0, fail = 0, skipped = 0;
 const fails = [];
@@ -70,7 +72,7 @@ async function main() {
 
   // ---- 1. 会话启动 ----
   console.log("\n[1] 会话生命周期");
-  let out = bu(["start", "--headless"]);
+  let out = bu(["start"]);
   sessionId = (out.match(/session=(\S+)/) ?? [])[1];
   ok("start 输出 session id", !!sessionId, out.slice(0, 120));
   const st = JSON.parse(bu(["status", "--output-format=json"]));

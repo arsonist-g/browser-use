@@ -11,6 +11,11 @@ const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 // 版本号单一来源 = package.json(此前硬编码曾连续两版未同步)
 const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
 
+// 无头启动已禁用(反检测红线):无头形态未做反爬验证,且无头反爬难度远高于有头,
+// 因此 AI 调用面一律有头。唯一例外是自动化测试:进程环境带 BU_DEV_ALLOW_HEADLESS=1 时放行
+// (只服务测试,不写进 SKILL.md)
+const DEV_HEADLESS = process.env.BU_DEV_ALLOW_HEADLESS === "1";
+
 // ---- 工具位置参数表(P0;M2/M3 占位工具原样转发 flags) ----
 const TOOL_POS = {
   click: ["uid"], fill: ["uid", "value"], hover: ["uid"], drag: ["from_uid", "to_uid"],
@@ -30,7 +35,7 @@ const TOOL_POS = {
   execute_webmcp_tool: ["toolName"],
 };
 const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
-  "headless", "bringToFront", "fix"]);
+  "bringToFront", "fix"]);
 
 // ---- utils ----
 function out(text) { process.stdout.write(text + "\n"); }
@@ -116,7 +121,7 @@ async function main() {
   const argv = process.argv.slice(2);
   // 通用解析:--flag value / --boolFlag / 位置参数(工具参数各异,不再逐一声明)
   const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
-    "headless", "bringToFront", "fix", "dry-run", "force", "remove"]);
+    "bringToFront", "fix", "dry-run", "force", "remove"]);
   const values = {};   // flags
   const positionals = [];
   for (let i = 1; i < argv.length; i++) {
@@ -137,7 +142,7 @@ async function main() {
   if (!command || command === "--help" || command === "-h") {
     out(`browser-use ${VERSION}
 usage:
-  browser-use start [--headless] [--browser-exe <path>]
+  browser-use start [--browser-exe <path>]     # 始终有头:无头启动已禁用
   browser-use stop --session=<id>
   browser-use sessions list [--state=<s>] | sessions clean
   browser-use status
@@ -172,13 +177,18 @@ usage:
   try {
     switch (command) {
       case "start": {
+        // 参数已移除的显式拒绝:静默忽略会让调用方以为拿到了无头会话,而实际是有头
+        if ("headless" in values) {
+          die(2, "无头启动已禁用:`--headless` 参数已移除,本工具只支持有头启动"
+            + "(无头形态未经反爬验证,无头反爬难度远高于有头)。直接运行 browser-use start 即可。");
+        }
         await ensureDaemon();
         let extraFlags;
         if (values["extra-flags"]) {
           try { extraFlags = JSON.parse(values["extra-flags"]); }
           catch { extraFlags = values["extra-flags"].split(/\s+/).filter(Boolean); }
         }
-        const r = await rpc("session.start", { headless: values.headless, browser_exe: values["browser-exe"], extra_flags: extraFlags });
+        const r = await rpc("session.start", { headless: DEV_HEADLESS, browser_exe: values["browser-exe"], extra_flags: extraFlags });
         if (jsonMode) return outJson(r);
         out(`session=${r.session_id}`);
         if (r.login_state === "injected") out("login=injected(登录态已注入)");

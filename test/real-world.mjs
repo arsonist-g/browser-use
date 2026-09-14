@@ -16,6 +16,8 @@ const CLI = path.join(ROOT, "bin", "browser-use.mjs");
 const FIXTURE_PORT = 18124;
 const BASE = `http://127.0.0.1:${FIXTURE_PORT}`;
 const HEADED = process.argv.includes("--headed");
+// 无头启动已从 CLI 移除(反检测红线):测试进程经本环境变量显式放行,无头只作补充形态
+if (!HEADED) process.env.BU_DEV_ALLOW_HEADLESS = "1";
 const ART = fs.mkdtempSync(path.join(os.tmpdir(), "bu-rw-"));
 
 let pass = 0, fail = 0, skipped = 0;
@@ -59,7 +61,7 @@ async function main() {
   if (!up) { console.log(`fail: 1`); process.exit(1); }
   try {
   console.log("\n[RW] 会话启动");
-  const out = bu(["start", ...(HEADED ? [] : ["--headless"])]);
+  const out = bu(["start"]);
   sessionId = (out.match(/session=(\S+)/) ?? [])[1];
   ok("RW0 start", !!sessionId, out.slice(0, 80));
 

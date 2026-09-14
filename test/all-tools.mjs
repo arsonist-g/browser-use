@@ -12,6 +12,8 @@ const CLI = path.join(ROOT, "bin", "browser-use.mjs");
 const FIXTURE_PORT = 18123;
 const BASE = `http://127.0.0.1:${FIXTURE_PORT}`;
 const HEADED = process.argv.includes("--headed");
+// 无头启动已从 CLI 移除(反检测红线):测试进程经本环境变量显式放行,无头只作补充形态
+if (!HEADED) process.env.BU_DEV_ALLOW_HEADLESS = "1";
 
 const results = {};  // tool -> PASS/FAIL/SKIP(原因)
 function mark(tool, status, detail = "") { results[tool] = { status, detail }; console.log(`  ${status === "PASS" ? "✔" : status === "SKIP" ? "○" : "✘"} ${tool}${detail ? ` — ${detail.slice(0, 140)}` : ""}`); }
@@ -46,7 +48,7 @@ async function main() {
   if (!up) { console.error("fixture server failed"); process.exit(1); }
 
   // ---------- 启动 ----------
-  let out = bu(["start", ...(HEADED ? [] : ["--headless"])]);
+  let out = bu(["start"]);
   sessionId = (out.match(/session=(\S+)/) ?? [])[1];
   const st = JSON.parse(bu(["status", "--output-format=json"]));
   const bridgeOn = st.bridge.connected;
@@ -651,7 +653,7 @@ async function main() {
   // ========== WebMCP (2)——专用 flag 会话(flag 属运行时特征变更,默认不开 = CONSTRAINT-001 权衡) ==========
   let webSession = null;
   try {
-    const wout = bu(["start", "--headless", "--extra-flags", JSON.stringify(["--enable-features=WebMCP"])]);
+    const wout = bu(["start", "--extra-flags", JSON.stringify(["--enable-features=WebMCP"])]);
     webSession = (wout.match(/session=(\S+)/) ?? [])[1];
   } catch (e) {
     mark("list_webmcp_tools", "SKIP", `专用会话启动失败(环境): ${String(e.stdout || e.message).slice(0, 100)}`);

@@ -34,14 +34,14 @@ test("config: set/set 类型转换/reset 单键恢复默认", () => {
   try {
     setConfigKey("tool_default_timeout_ms", "45000");
     assert.equal(loadConfig(true).tool_default_timeout_ms, 45000, "字符串数字 → number");
-    setConfigKey("headless_default", "true");
-    assert.equal(loadConfig(true).headless_default, true, "字符串 → bool");
+    setConfigKey("disable_extensions", "true");
+    assert.equal(loadConfig(true).disable_extensions, true, "字符串 → bool");
     assert.throws(() => setConfigKey("not_a_key", "1"), /unknown config key/);
   } finally {
     resetConfigKey("tool_default_timeout_ms");
-    resetConfigKey("headless_default");
+    resetConfigKey("disable_extensions");
   }
   const cfg = loadConfig(true);
   assert.equal(cfg.tool_default_timeout_ms, DEFAULTS.tool_default_timeout_ms);
-  assert.equal(cfg.headless_default, DEFAULTS.headless_default);
+  assert.equal(cfg.disable_extensions, DEFAULTS.disable_extensions);
 });

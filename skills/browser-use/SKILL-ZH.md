@@ -23,7 +23,7 @@ description: 通过 browser-use CLI 自动化需要登录态或受反爬检测�
 
 ## Sessions:一个任务一个会话,每条命令都带 `--session=<id>`
 
-1. **启动**:`browser-use start`(后台工作加 `--headless`)。它注入登录 cookie 并启动一个隔离的 Edge,然后打印 `session=<id>`。**记住这个 id**,之后每条命令都带上。你不能自选 id。每个会话是独立的 Edge 实例,并发的 AI 窗口永不共享浏览器。
+1. **启动**:`browser-use start`。它注入登录 cookie 并启动一个隔离的 Edge(始终有头——无头启动已禁用,见 Red lines),然后打印 `session=<id>`。**记住这个 id**,之后每条命令都带上。你不能自选 id。每个会话是独立的 Edge 实例,并发的 AI 窗口永不共享浏览器。
 2. **工作**:对会话执行工具调用(见 AI workflow)。
 3. **停止**:任务完成时 `browser-use stop --session=<id>`。它关闭 Edge 并完整删除该会话的数据——一次性 profile、artifacts(截图/trace/快照)与会话记录,一律不留;需要在会话外保留的内容先取走。必须停止你的会话;不要留下后台浏览器。
 
@@ -97,6 +97,7 @@ browser-use <tool> --session=<id> [必需位置参数] [--可选flags]
 
 - **不做指纹覆盖。** user agent、平台、语言覆盖被有意禁用;`emulate` 会拒绝这些参数。反爬系统会将它们与 TLS 及行为信号交叉验证,不一致本身就是检测信号。不要绕过。
 - **留在本机真实 Edge 上。** 不要用 `--browser-exe` 指向别的浏览器并期待同样的反检测行为。
+- **只允许有头启动。** 不要寻找让浏览器无头运行的办法:`--headless` 参数已移除,CLI 会直接拒绝。无头形态从未做过反爬验证,而无头反爬难度远高于有头,因此无头会话不受支持,也不是更省事的选项。
 - **一个任务一个会话。** start、工作、`stop`。会话持有用户 cookie 的完整副本:不要跨任务传递会话 id,任务结束立即停止。
 
 
@@ -260,7 +261,7 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 
 | Command | Parameters | Notes |
 |---|---|---|
-| `start` | `--headless` `--browser-exe` `--extra-flags` | The only command without `--session`; prints `session=<id>`. |
+| `start` | `--browser-exe` `--extra-flags` | The only command without `--session`; prints `session=<id>`. Always headed: `--headless` was removed and is rejected. |
 | `stop` | `--session=<id>` | Closes the browser and deletes the session directory entirely (profile, artifacts, logs). |
 | `sessions list` / `sessions clean` | `[--state=<s>]` | `clean` reaps orphaned sessions. |
 | `session.bare` | `--session=<id>` | Skips login-state injection. |
