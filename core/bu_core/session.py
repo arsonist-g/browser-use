@@ -7,6 +7,8 @@ import time
 
 from DrissionPage import Chromium, ChromiumOptions
 
+from .cdp_events import BrowserNetworkRecorder
+
 # console.* 捕获 hook:Console 域在新版 Edge/Chrome 不再派发事件(实测 enable 成功但 0 事件),
 # 而 Runtime.enable 属红线(CONSTRAINT-001)。改为 addScriptToEvaluateOnNewDocument 注入透传
 # hook(仅包 console 五法,原方法照常执行,缓冲留在页内,每文档一个随机 epoch 供去重)。
@@ -63,7 +65,12 @@ class BrowserSession:
         self.webmcp_enabled = "--enable-features=WebMCP" in self.extra_flags
         self.browser = None
         self.tab = None
+        self.net_recorder = None
         self._last_active_tab_id = None
+        self._tab_cache = {}
+        self._known_tab_ids = set()
+        self._tab_urls = {}
+        self._pending_page_notices = []
         # 页内工具共用状态
         self.listen_started = False
         self.console_started = False
@@ -108,10 +115,17 @@ class BrowserSession:
             if self.headless:
                 co.headless()
         self.browser = Chromium(co)
+        try:
+            self.net_recorder = BrowserNetworkRecorder(self.port).start()
+        except Exception:
+            self.net_recorder = None
         self.tab = self.browser.latest_tab
         self.prune_edge_popups()
         self.tab = self.browser.latest_tab
-        self._last_active_tab_id = getattr(self.tab, "tab_id", None)
+        self._register_tab(self.tab)
+        self._known_tab_ids = {self._raw_tab_id(self.tab)}
+        self._tab_urls = {self._raw_tab_id(self.tab): self._tab_url(self.tab)}
+        self._last_active_tab_id = self._raw_tab_id(self.tab)
         # 会话级监听尽早开启(listen/console 只捕开启后的事件)
         try:
             self.tab.listen.start()
@@ -149,30 +163,159 @@ class BrowserSession:
             "browser_version": bv,
         }
 
-    @property
-    def t(self):
-        # 页面工具以浏览器活动标签页为准:AI 点击 target=_blank 打开的前台新页与
-        # 用户手工切换都必须被跟随。DP 的 get_tabs() 每次返回全新对象,按 tab_id
-        # 复用列表中的对象,避免 tab 级 listen/console 状态丢失。
-        tabs = self.browser.get_tabs()
-        if not tabs:
-            return self.tab
-        active = tabs[0]
-        active_id = getattr(active, "tab_id", None)
-        if active_id is not None and active_id != self._last_active_tab_id:
-            self.tab = active
+    def _raw_tab_id(self, tab):
+        return getattr(tab, "tab_id", None) or getattr(tab, "_target_id", None)
+
+    def _tab_url(self, tab):
+        try:
+            return str(tab.url or "")
+        except Exception:
+            return ""
+
+    def _register_tab(self, tab):
+        """按 tab_id 复用固定 tab 对象,保留 listen/console 的 tab 级状态。"""
+        tid = self._raw_tab_id(tab)
+        if tid is None:
+            return tab
+        cached = self._tab_cache.get(tid)
+        if cached is not None:
+            return cached
+        self._tab_cache[tid] = tab
+        if self.listen_started:
+            try:
+                if not getattr(tab.listen, "listening", False):
+                    tab.listen.start()
+            except Exception:
+                pass
+        install_console_hook(tab)
+        return tab
+
+    def _tab_index(self, tabs, tid):
+        for i, tab in enumerate(tabs):
+            if self._raw_tab_id(tab) == tid:
+                return i
+        return None
+
+    def observe_page_changes(self, announce=True):
+        """观察浏览器活动页/新页/URL 变化,并在下一次快照前累积提醒。"""
+        try:
+            raw_tabs = self.browser.get_tabs()
+        except Exception:
+            return
+        if not raw_tabs:
+            return
+        tabs = [self._register_tab(tb) for tb in raw_tabs]
+        ids = [self._raw_tab_id(tb) for tb in tabs]
+        urls = [self._tab_url(tb) for tb in tabs]
+        if not any(ids):
+            return
+        active_id = ids[0]
+        previous_active_id = self._last_active_tab_id
+        new_ids = [tid for tid in ids if tid not in self._known_tab_ids]
+        active_changed = active_id != previous_active_id
+        if announce:
+            for tid in new_ids:
+                idx = self._tab_index(tabs, tid)
+                if idx is None:
+                    continue
+                if tid == active_id:
+                    self._pending_page_notices.append(
+                        f"notice: New page opened and became active: page_id={idx}, url={urls[idx]}")
+                else:
+                    self._pending_page_notices.append(
+                        f"notice: New page opened in background: page_id={idx}, url={urls[idx]}")
+            if active_changed and active_id not in new_ids and previous_active_id is not None:
+                idx = self._tab_index(tabs, active_id)
+                if idx is not None:
+                    self._pending_page_notices.append(
+                        f"notice: Active page changed to page_id={idx}, url={urls[idx]}")
+            if active_changed and previous_active_id in ids:
+                prev_idx = self._tab_index(tabs, previous_active_id)
+                if prev_idx is not None:
+                    self._pending_page_notices.append(
+                        f"notice: Previous page page_id={prev_idx} remains available; "
+                        f"use select_page {prev_idx} then list_network_requests to inspect its requests")
+            for idx, tid in enumerate(ids):
+                old = self._tab_urls.get(tid)
+                if old is not None and old != urls[idx] and tid not in new_ids:
+                    self._pending_page_notices.append(
+                        f"notice: Page page_id={idx} navigated to {urls[idx]}")
+        if active_changed or self.tab is None or self._raw_tab_id(self.tab) not in ids:
+            self.tab = tabs[0]
+        self._known_tab_ids = set(ids)
+        self._tab_urls = dict(zip(ids, urls, strict=True))
         self._last_active_tab_id = active_id
 
-        cur_id = getattr(self.tab, "tab_id", None)
-        if cur_id is not None:
-            current = next((tb for tb in tabs if getattr(tb, "tab_id", None) == cur_id), None)
-            if current is not None:
-                self.tab = current
-                return current
-        # 当前选择页已关闭/尚未选择:浏览器解析出的活动页直接接管,不再要求
-        # list_pages 先显式恢复(当前需求覆盖旧的 selected-page-closed 语义)。
-        self.tab = active
-        return active
+    def consume_page_notices(self):
+        notices = list(self._pending_page_notices)
+        self._pending_page_notices.clear()
+        return notices
+
+    @property
+    def t(self):
+        self.observe_page_changes()
+        if self.tab is None:
+            raw = self.browser.get_tabs()
+            if raw:
+                self.tab = self._register_tab(raw[0])
+        return self.tab
+
+    def _active_tab_id(self):
+        try:
+            tabs = self.browser.get_tabs()
+        except Exception:
+            return None
+        return self._raw_tab_id(tabs[0]) if tabs else None
+
+    def _activate_tab(self, tab):
+        """显式选页的硬语义:浏览器活动页必须与驱动当前页一致。"""
+        tid = self._raw_tab_id(tab)
+        if not tid:
+            raise RuntimeError("selected page has no target id")
+        if self._active_tab_id() == tid:
+            self.tab = tab
+            return
+        try:
+            self.browser.activate_tab(tid)
+        except Exception:
+            pass
+        try:
+            tab.run_cdp("Page.bringToFront")
+        except Exception:
+            pass
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if self._active_tab_id() == tid:
+                self.tab = tab
+                return
+            time.sleep(0.05)
+        # 后台窗口/未聚焦窗口的兜底:最小化再恢复后重试一次。
+        try:
+            win = self.browser._run_cdp("Browser.getWindowForTarget", targetId=tid)
+            wid = win.get("windowId")
+            if wid is not None:
+                self.browser._run_cdp("Browser.setWindowBounds", windowId=wid,
+                                      bounds={"windowState": "minimized"})
+                time.sleep(0.1)
+                self.browser._run_cdp("Browser.setWindowBounds", windowId=wid,
+                                      bounds={"windowState": "normal"})
+        except Exception:
+            pass
+        try:
+            self.browser.activate_tab(tid)
+        except Exception:
+            pass
+        try:
+            tab.run_cdp("Page.bringToFront")
+        except Exception:
+            pass
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            if self._active_tab_id() == tid:
+                self.tab = tab
+                return
+            time.sleep(0.05)
+        raise RuntimeError("Failed to bring selected page to the browser foreground")
 
     def _whitelist_paths(self):
         """白名单扩展目录(Should 机制;首版无实现,恒空 = 全禁扩展)。"""
@@ -201,8 +344,9 @@ class BrowserSession:
             pass
 
     def pages(self):
+        tabs = [self._register_tab(tb) for tb in self.browser.get_tabs()]
         return [{"page_id": str(i), "url": t.url, "title": t.title}
-                for i, t in enumerate(self.browser.get_tabs())]
+                for i, t in enumerate(tabs)]
 
     def recover_page_selection(self):
         """上游 createPagesSnapshot 语义:选中页已关时自动回退 pages[0] 并留痕。
@@ -215,7 +359,8 @@ class BrowserSession:
             return None
         if self.tab is None:
             return None
-        self.tab = tabs[0]
+        self.tab = self._register_tab(tabs[0])
+        self._last_active_tab_id = self._raw_tab_id(self.tab)
         return "Note: the previously selected page was closed. Page 0 is now selected."
 
     def select_page(self, page_id):
@@ -223,11 +368,18 @@ class BrowserSession:
         idx = int(page_id)
         if idx < 0 or idx >= len(tabs):
             raise ValueError("No page found")  # 文案对齐 cdt getPageById
-        self.tab = tabs[idx]
-        # 选择后台页时同步记录当前活动页;此后只有活动页真实变化才覆盖这次选择。
-        self._last_active_tab_id = getattr(tabs[0], "tab_id", None)
+        target = self._register_tab(tabs[idx])
+        self._activate_tab(target)
+        self.tab = target
+        # 显式选页本身不产生"意外页面变化"提醒,但同步活动页基线。
+        self.observe_page_changes(announce=False)
 
     def stop(self):
+        try:
+            if self.net_recorder:
+                self.net_recorder.close()
+        except Exception:
+            pass
         try:
             if self.browser:
                 self.browser.quit()

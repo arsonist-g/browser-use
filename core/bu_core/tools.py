@@ -10,7 +10,6 @@ import time
 
 from . import humanize
 from .cdp_events import ensure_session_cdp
-from .session import install_console_hook
 from .snapshot import build_snapshot
 
 
@@ -272,10 +271,21 @@ def _uid_quad(sess, uid):
     return (vx, vy)
 
 
+def _snapshot_with_notices(sess, text):
+    notices = sess.consume_page_notices() if hasattr(sess, "consume_page_notices") else []
+    if not notices:
+        return text, []
+    return "\n".join(notices) + "\n" + text, notices
+
+
 def _with_snapshot(sess, include, extra=None):
     if include:
         snap = build_snapshot(sess)
-        return {"result": extra or {"done": True}, "snapshot": snap["text"]}
+        text, notices = _snapshot_with_notices(sess, snap["text"])
+        out = {"result": extra or {"done": True}, "snapshot": text}
+        if notices:
+            out["notices"] = notices
+        return out
     return {"result": extra or {"done": True}}
 
 
@@ -314,13 +324,15 @@ def take_snapshot(sess, args, session_dir):
     except Exception:
         pass
     snap = build_snapshot(sess, verbose=bool(args.get("verbose")))
+    text, notices = _snapshot_with_notices(sess, snap["text"])
     fp = args.get("filePath")
     if fp:
         # cdt 语义:给 filePath 时保存到文件,响应不再附快照全文
         with open(fp, "w", encoding="utf-8") as f:
-            f.write(snap["text"])
-        return {"path": fp}
-    return {"text": snap["text"], "uid_count": snap["uid_count"]}
+            f.write(text)
+        return {"path": fp, **({"notices": notices} if notices else {})}
+    return {"text": text, "uid_count": snap["uid_count"],
+            **({"notices": notices} if notices else {})}
 
 
 def scroll(sess, args, session_dir):
@@ -805,17 +817,25 @@ def new_page(sess, args, session_dir):
     background = bool(args.get("background"))
     isolated = args.get("isolatedContext")
     timeout_ms = args.get("timeout")
+    previous = sess.t
     if isolated:
         tab = _new_tab_in_context(sess, str(isolated), url, background)
     else:
         tab = sess.browser.new_tab(url, new_context=False, background=background)
-    sess.tab = tab
-    _ensure_listen(sess)  # 新 tab 的监听与 console hook 独立
-    install_console_hook(tab)
+    tab = sess._register_tab(tab)
+    if background:
+        # 显式后台页不改变当前页;部分 Chromium 会忽略 createTarget 的 background,
+        # 因此创建后把原页重新激活,保证驱动与浏览器前台都不漂移。
+        if previous is not None:
+            sess._activate_tab(previous)
+    else:
+        sess._activate_tab(tab)
     try:
         tab.wait.doc_loaded((float(timeout_ms) / 1000.0) if timeout_ms else 10)
     except Exception:
         pass
+    # 显式 new_page 的目标已知:同步状态但不生成"意外新页"提醒。
+    sess.observe_page_changes(announce=False)
     # cdt 语义:响应附页面列表并指向新页(pageId 按创建序号,与 list_pages 一致)
     tabs = sess.browser.get_tabs()
     idx = next((i for i, tb in enumerate(tabs)
@@ -852,9 +872,7 @@ def list_pages(sess, args, session_dir):
 
 def select_page(sess, args, session_dir):
     sess.select_page(args["page_id"])
-    if args.get("bringToFront"):
-        sess.tab.set.activate()
-    return {"page_id": str(args["page_id"])}
+    return {"page_id": str(args["page_id"]), "url": sess.tab.url}
 
 
 def close_page(sess, args, session_dir):
@@ -1152,11 +1170,63 @@ def get_console_message(sess, args, session_dir):
     return {"message": buf[idx]}
 
 
+def _packet_key(p, fallback_target=None):
+    if isinstance(p, dict):
+        return (p.get("target_id"), p.get("requestId"))
+    raw = getattr(p, "_raw_request", None) or {}
+    rid = raw.get("requestId") if isinstance(raw, dict) else None
+    tid = getattr(p, "tab_id", None) or fallback_target
+    return (tid, rid if rid is not None else id(p))
+
+
+def _packet_method(p):
+    return p.get("method") if isinstance(p, dict) else p.method
+
+
+def _packet_url(p):
+    return p.get("url") if isinstance(p, dict) else p.url
+
+
+def _packet_status(p):
+    if isinstance(p, dict):
+        return p.get("status")
+    try:
+        return p.response.status
+    except Exception:
+        return None
+
+
+def _packet_resource_type(p):
+    if isinstance(p, dict):
+        return p.get("resourceType") or "Other"
+    return getattr(p, "resourceType", None) or "Other"
+
+
+def _packet_body(p):
+    if not isinstance(p, dict):
+        try:
+            return p.response.body
+        except Exception:
+            return None
+    body = p.get("body")
+    if body is not None and p.get("base64_encoded"):
+        try:
+            raw = base64.b64decode(body)
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return body
+        except Exception:
+            return None
+    return body
+
+
 def list_network_requests(sess, args, session_dir):
     """收割模式:返回自上次调用以来新捕获的请求(DP 导航会自动停监听,导航前后惰性重启)。
     请求包按 reqid 存入会话级累积缓冲,get_network_request 按 reqid 查详情。
     对齐 cdt:resourceTypes 按 CDP ResourceType 过滤;pageSize/pageIdx 分页;
-    includePreservedRequests=true 返回会话级全缓冲(跨导航,语义超集)。"""
+    includePreservedRequests=true 返回会话级全缓冲(跨导航,语义超集)。
+    浏览器级 Network 采集器补齐新 tab 在 DP 对象挂载前已发出的早期请求。"""
     _ensure_listen(sess)
     packets = []
     # 收割语义 = "排空已捕获积压 + 等新包"。steps 的 timeout 是包间隔语义(每收一包
@@ -1178,14 +1248,37 @@ def list_network_requests(sess, args, session_dir):
     buf = getattr(sess, "_net_buffer", None)
     if buf is None:
         buf = sess._net_buffer = []
+    keys = getattr(sess, "_net_keys", None)
+    if keys is None:
+        keys = sess._net_keys = set()
+    target_id = getattr(sess.t, "_target_id", None) or getattr(sess.t, "tab_id", None)
+    new_items = []
+    for p in packets:
+        key = _packet_key(p, target_id)
+        if key in keys:
+            continue
+        keys.add(key)
+        new_items.append(p)
+    recorder = getattr(sess, "net_recorder", None)
+    if recorder is not None and target_id:
+        try:
+            early = recorder.records_for_target(target_id)
+        except Exception:
+            early = []
+        for rec in early:
+            key = _packet_key(rec, target_id)
+            if key in keys:
+                continue
+            keys.add(key)
+            new_items.append(rec)
     start = len(buf)
-    buf.extend(packets)
-    listed = list(buf) if args.get("includePreservedRequests") else packets
+    buf.extend(new_items)
+    listed = list(buf) if args.get("includePreservedRequests") else new_items
     base = 0 if args.get("includePreservedRequests") else start
     types = args.get("resourceTypes")
-    out = [{"reqid": str(base + i), "method": p.method, "url": p.url,
-            "status": getattr(p.response, "status", None),
-            "resourceType": (getattr(p, "resourceType", None) or "Other").lower()}
+    out = [{"reqid": str(base + i), "method": _packet_method(p), "url": _packet_url(p),
+            "status": _packet_status(p),
+            "resourceType": _packet_resource_type(p).lower()}
            for i, p in enumerate(listed)]
     if types:
         if isinstance(types, str):  # CLI 通道:单值字符串
@@ -1207,6 +1300,8 @@ def _force_ext(path, ext):
 def _request_post_data(p):
     """请求体原文:DP 已按需拉过 Network.getRequestPostData(_raw_post_data);
     body 内联在事件里时取 _raw_request.request.postData。无 = None。"""
+    if isinstance(p, dict):
+        return p.get("postData")
     raw = getattr(p, "_raw_post_data", None)
     if raw:
         return raw
@@ -1236,26 +1331,35 @@ def get_network_request(sess, args, session_dir):
     if not buf or idx < 0 or idx >= len(buf):
         raise ValueError("Request not found for selected page")  # 文案对齐 cdt PageCollector.getById
     p = buf[idx]
-    body = None
-    try:
-        body = p.response.body
-    except Exception:
-        pass  # 无响应体(未完成/二进制/已失效)→ 返回 null
-    # 详情字段:从 DP 保存的原始 CDP 事件参数提取(requestWillBeSent/responseReceived)
-    req_raw = getattr(p, "_raw_request", None) or {}
-    resp_raw = getattr(p, "_raw_response", None) or {}
-    req_info = req_raw.get("request", {}) if isinstance(req_raw, dict) else {}
-    out = {"request": {"reqid": str(idx), "method": p.method, "url": p.url,
-                       "status": getattr(p.response, "status", None),
-                       "statusText": resp_raw.get("statusText"),
-                       "resourceType": (getattr(p, "resourceType", None) or "Other").lower(),
-                       "requestHeaders": req_info.get("headers", {}),
-                       "responseHeaders": resp_raw.get("headers", {}),
-                       "mimeType": resp_raw.get("mimeType"),
-                       "protocol": resp_raw.get("protocol"),
-                       "fromDiskCache": resp_raw.get("fromDiskCache"),
-                       "timing": resp_raw.get("timing"),
-                       "remoteIPAddress": resp_raw.get("remoteIPAddress")}}
+    body = _packet_body(p)
+    if isinstance(p, dict):
+        out = {"request": {"reqid": str(idx), "method": _packet_method(p),
+                           "url": _packet_url(p), "status": _packet_status(p),
+                           "statusText": p.get("statusText"),
+                           "resourceType": _packet_resource_type(p).lower(),
+                           "requestHeaders": p.get("requestHeaders") or {},
+                           "responseHeaders": p.get("responseHeaders") or {},
+                           "mimeType": p.get("mimeType"),
+                           "protocol": p.get("protocol"),
+                           "fromDiskCache": None,
+                           "timing": None,
+                           "remoteIPAddress": None}}
+    else:
+        # 详情字段:从 DP 保存的原始 CDP 事件参数提取(requestWillBeSent/responseReceived)
+        req_raw = getattr(p, "_raw_request", None) or {}
+        resp_raw = getattr(p, "_raw_response", None) or {}
+        req_info = req_raw.get("request", {}) if isinstance(req_raw, dict) else {}
+        out = {"request": {"reqid": str(idx), "method": p.method, "url": p.url,
+                           "status": getattr(p.response, "status", None),
+                           "statusText": resp_raw.get("statusText"),
+                           "resourceType": (getattr(p, "resourceType", None) or "Other").lower(),
+                           "requestHeaders": req_info.get("headers", {}),
+                           "responseHeaders": resp_raw.get("headers", {}),
+                           "mimeType": resp_raw.get("mimeType"),
+                           "protocol": resp_raw.get("protocol"),
+                           "fromDiskCache": resp_raw.get("fromDiskCache"),
+                           "timing": resp_raw.get("timing"),
+                           "remoteIPAddress": resp_raw.get("remoteIPAddress")}}
     # 落盘参数(cdt 同名参):给 filePath 时该侧 body 不再内联(上游 one-of 语义,
     # 字段 = requestBodyFilePath/responseBodyFilePath);取不到 body 报占位文案
     req_fp, resp_fp = args.get("requestFilePath"), args.get("responseFilePath")

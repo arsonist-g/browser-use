@@ -62,6 +62,7 @@ def main():
             if fn is None:
                 raise NotImplementedError(f"tool {tool} 尚未实现(M2/M3 占位,机制摸底后补齐)")
             sess.prune_edge_popups()
+            sess.observe_page_changes()
             t0 = time.monotonic()
             res = fn(sess, payload.get("args") or {}, args.session_dir)
             dur = int((time.monotonic() - t0) * 1000)

@@ -6,6 +6,7 @@
 """
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +36,177 @@ def pipe_call(session_id, method, timeout=30, **params):
         raise RuntimeError(f"pipe CDP {method}: {resp.get('error', {}).get('message', resp)}")
     return resp.get("result", {})
 
+
+class BrowserNetworkRecorder:
+    """浏览器级 Network 采集器:新 page target 暂停→Network.enable→放行。
+
+    浏览器级 auto-attach 先于渲染进程执行,配合 Network.enable 可捕获新标签页
+    导航首包;Runtime.runIfWaitingForDebugger 只负责放行暂停 target,不启用 Runtime 域。
+    事件按 target 分桶,主线程按当前 tab 取用;DP listen 仍是主体,采集器用于补齐
+    DP 对象尚未挂载的早期请求。
+    """
+
+    _BODY_TYPES = {"document", "xhr", "fetch"}
+    _MAX_BODY_BYTES = 5 * 1024 * 1024
+
+    def __init__(self, port):
+        self.port = port
+        self.ws = None
+        self.error = None
+        self._id = 0
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+        self._sessions = {}       # CDP sessionId -> targetId
+        self._requests = {}       # (targetId, requestId) -> record
+        self._order = []          # request keys in arrival order
+        self._body_wait = {}      # command id -> request key
+        self._send_lock = threading.Lock()
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="bu-net-recorder", daemon=True)
+        self._thread.start()
+        self._ready.wait(8)
+        return self
+
+    def close(self):
+        self._stop.set()
+        try:
+            if self.ws:
+                self.ws.close()
+        except Exception:
+            pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+
+    def records_for_target(self, target_id):
+        with self._lock:
+            return [dict(self._requests[k]) for k in self._order
+                    if k[0] == target_id and k in self._requests]
+
+    def _send(self, method, session_id=None, **params):
+        with self._send_lock:
+            self._id += 1
+            mid = self._id
+            msg = {"id": mid, "method": method, "params": params}
+            if session_id:
+                msg["sessionId"] = session_id
+            self.ws.send(json.dumps(msg))
+            return mid
+
+    def _run(self):
+        try:
+            version = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/version", timeout=5).read())
+            ws_url = version.get("webSocketDebuggerUrl")
+            if not ws_url:
+                raise RuntimeError("browser websocket unavailable")
+            self.ws = websocket.create_connection(
+                ws_url, timeout=0.25, suppress_origin=True)
+            self._send("Target.setAutoAttach", autoAttach=True,
+                       waitForDebuggerOnStart=True, flatten=True,
+                       filter=[{"type": "page", "exclude": False}])
+            self._ready.set()
+            while not self._stop.is_set():
+                try:
+                    raw = self.ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception:
+                    if self._stop.is_set():
+                        break
+                    raise
+                if raw:
+                    self._on_message(json.loads(raw))
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            self._ready.set()
+
+    def _on_message(self, msg):
+        if "id" in msg:
+            key = self._body_wait.pop(msg["id"], None)
+            if key is not None and "result" in msg:
+                with self._lock:
+                    rec = self._requests.get(key)
+                    if rec is not None:
+                        rec["body"] = msg["result"].get("body")
+                        rec["base64_encoded"] = bool(msg["result"].get("base64Encoded"))
+            return
+        method = msg.get("method")
+        params = msg.get("params") or {}
+        sid = msg.get("sessionId")
+        if method == "Target.attachedToTarget":
+            ti = params.get("targetInfo") or {}
+            child_sid = params.get("sessionId")
+            if ti.get("type") == "page" and ti.get("targetId") and child_sid:
+                with self._lock:
+                    self._sessions[child_sid] = ti["targetId"]
+                self._send("Network.enable", session_id=child_sid)
+                if params.get("waitingForDebugger"):
+                    self._send("Runtime.runIfWaitingForDebugger", session_id=child_sid)
+            return
+        if method == "Target.detachedFromTarget":
+            child_sid = params.get("sessionId")
+            with self._lock:
+                self._sessions.pop(child_sid, None)
+            return
+        if not method or not method.startswith("Network."):
+            return
+        target_id = self._sessions.get(sid)
+        if not target_id:
+            return
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        key = (target_id, request_id)
+        with self._lock:
+            if method == "Network.requestWillBeSent":
+                req = params.get("request") or {}
+                rec = {
+                    "requestId": request_id,
+                    "target_id": target_id,
+                    "session_id": sid,
+                    "method": req.get("method"),
+                    "url": req.get("url"),
+                    "requestHeaders": req.get("headers") or {},
+                    "postData": req.get("postData"),
+                    "resourceType": params.get("type") or "Other",
+                    "status": None,
+                    "statusText": None,
+                    "responseHeaders": {},
+                    "mimeType": None,
+                    "protocol": None,
+                    "body": None,
+                    "base64_encoded": False,
+                    "finished": False,
+                    "failed": False,
+                    "errorText": None,
+                    "encodedDataLength": None,
+                }
+                self._requests[key] = rec
+                self._order.append(key)
+            rec = self._requests.get(key)
+            if rec is None:
+                return
+            if method == "Network.responseReceived":
+                resp = params.get("response") or {}
+                rec["status"] = resp.get("status")
+                rec["statusText"] = resp.get("statusText")
+                rec["responseHeaders"] = resp.get("headers") or {}
+                rec["mimeType"] = resp.get("mimeType")
+                rec["protocol"] = resp.get("protocol")
+            elif method == "Network.loadingFinished":
+                rec["finished"] = True
+                rec["encodedDataLength"] = params.get("encodedDataLength")
+                if (rec.get("resourceType") in self._BODY_TYPES
+                        and (rec.get("encodedDataLength") or 0) <= self._MAX_BODY_BYTES):
+                    mid = self._send("Network.getResponseBody",
+                                     session_id=rec["session_id"], requestId=request_id)
+                    self._body_wait[mid] = key
+            elif method == "Network.loadingFailed":
+                rec["failed"] = True
+                rec["errorText"] = params.get("errorText")
 
 class CdpEvents:
     def __init__(self, port, timeout=60, recv_granularity=0.25):

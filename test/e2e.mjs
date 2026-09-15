@@ -77,6 +77,46 @@ async function waitForActivePage(port, expectedUrl, timeoutMs = 5000) {
   return false;
 }
 
+async function waitForActivePagePrefix(port, expectedPrefix, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const [active] = await pageTargets(port);
+    if (active?.url?.startsWith(expectedPrefix)) return active.url;
+    await new Promise((r) => setTimeout(r, 100));
+  } while (Date.now() < deadline);
+  return null;
+}
+
+async function waitForPageTarget(port, expectedUrl, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const target = (await pageTargets(port)).find((t) => t.url === expectedUrl);
+    if (target) return target;
+    await new Promise((r) => setTimeout(r, 100));
+  } while (Date.now() < deadline);
+  return null;
+}
+
+function hasPageChangeNotice(text, pageId, url) {
+  const idPattern = new RegExp(`page_id\\s*[=:]\\s*["']?${pageId}["']?`, "i");
+  return idPattern.test(text) && text.includes(url)
+    && /(unexpected|changed|switch|opened|navigat|background|foreground|active)/i.test(text);
+}
+
+function hasUnexpectedNotice(text) {
+  return /unexpected\s+(?:page\s+)?change/i.test(text);
+}
+
+/** 非工具入口的后台页:模拟真实后台 popup,不经过显式 new_page。 */
+async function createBackgroundTarget(port, expectedUrl, keepActiveUrl) {
+  const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+  await cdpCall(version.webSocketDebuggerUrl, "Target.createTarget", { url: expectedUrl, background: true });
+  if (!(await waitForPageTarget(port, expectedUrl))) {
+    throw new Error(`background target not observed: ${expectedUrl}`);
+  }
+  await activatePageByUrl(port, keepActiveUrl);
+}
+
 function cdpCall(wsUrl, method, params = {}, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
@@ -426,6 +466,9 @@ async function main() {
       snap = bu(["take_snapshot", "--session", sessionId]);
       ok("click target=_blank 后 take_snapshot 跟随新活动页", snapshotDocUrl(snap) === blankUrl,
         `doc=${snapshotDocUrl(snap)}(期望 ${blankUrl})`);
+      const blankPageId = pageIdForUrl(sessionId, blankUrl);
+      ok("click target=_blank 后快照提示新前台页", !!blankPageId && hasPageChangeNotice(snap, blankPageId, blankUrl),
+        `page_id=${blankPageId} notice=${snap.split("\n").filter((l) => /page_id|changed|switch|opened|unexpected/i.test(l)).join(" || ").slice(0, 180)}`);
     } else {
       ok("click target=_blank 后 take_snapshot 跟随新活动页", false, "缺少新窗口链接 uid");
     }
@@ -493,6 +536,155 @@ async function main() {
     const mainId = pageIdForUrl(sessionId, tabMain);
     if (mainId) bu(["select_page", "--session", sessionId, mainId]);
   } catch { /* 收尾不依赖该恢复 */ }
+
+  // ---- 12.5 DEC-033:显式前台化 / 页面变化提醒 / 跨 tab listen 缓冲 ----
+  console.log("\n[12.5] DEC-033 页面变化与网络状态");
+  const d33Main = `${BASE}/?dec033=main`;
+  const d33Background = `${BASE}/child.html?dec033=explicit-background`;
+  const d33Popup = `${BASE}/deep.html?dec033=cdp-background`;
+  const d33Nav = `${BASE}/child.html?dec033=same-tab-nav`;
+  const d33Explicit = `${BASE}/deep.html?dec033=explicit-new`;
+  const d33NetworkOld = `${BASE}/?dec033=network-old`;
+  const d33NetworkChildPrefix = `${BASE}/child.html?dec033_net=`;
+
+  // Oracle: specified——select_page 必须真实前台化，而不是只改驱动路由。
+  try {
+    bu(["navigate_page", "--session", sessionId, d33Main]);
+    const bgCreated = JSON.parse(bu(["new_page", "--session", sessionId, d33Background,
+      "--background", "--output-format=json"]));
+    const bgId = pageIdForUrl(sessionId, d33Background);
+    ok("DEC-033 后台 new_page 不成为当前页", await waitForActivePage(debugPort, d33Main),
+      `独立活动页机制未观察到 ${d33Main}`);
+    const bgSnap = bu(["take_snapshot", "--session", sessionId]);
+    ok("DEC-033 后台 new_page 后快照仍读当前页", snapshotDocUrl(bgSnap) === d33Main,
+      `doc=${snapshotDocUrl(bgSnap)}(期望 ${d33Main})`);
+    ok("DEC-033 显式 new_page 不产生冗余 unexpected 提示", !hasUnexpectedNotice(bgSnap),
+      bgSnap.split("\n").filter((l) => /unexpected/i.test(l)).join(" || ").slice(0, 160));
+    if (bgId) {
+      await activatePageByUrl(debugPort, d33Main);
+      bu(["select_page", "--session", sessionId, bgId]);
+      const selectedActive = await waitForActivePage(debugPort, d33Background);
+      ok("DEC-033 select_page 实际前台化所选页", selectedActive,
+        `独立活动页机制未观察到 ${d33Background}`);
+      const selectedSnap = bu(["take_snapshot", "--session", sessionId]);
+      ok("DEC-033 select_page 后快照读取所选页", snapshotDocUrl(selectedSnap) === d33Background,
+        `doc=${snapshotDocUrl(selectedSnap)}(期望 ${d33Background})`);
+      ok("DEC-033 select_page 不产生冗余 unexpected 提示", !hasUnexpectedNotice(selectedSnap),
+        selectedSnap.split("\n").filter((l) => /unexpected/i.test(l)).join(" || ").slice(0, 160));
+    } else {
+      ok("DEC-033 select_page 实际前台化所选页", false, `page_id not found for ${d33Background}`);
+      ok("DEC-033 select_page 后快照读取所选页", false, "后台页未定位");
+      ok("DEC-033 select_page 不产生冗余 unexpected 提示", false, "后台页未定位");
+    }
+    const mainId = pageIdForUrl(sessionId, d33Main);
+    if (mainId) {
+      await activatePageByUrl(debugPort, d33Background);
+      bu(["select_page", "--session", sessionId, mainId, "--bringToFront"]);
+      ok("DEC-033 select_page --bringToFront 兼容并前台化", await waitForActivePage(debugPort, d33Main),
+        `独立活动页机制未观察到 ${d33Main}`);
+    } else {
+      ok("DEC-033 select_page --bringToFront 兼容并前台化", false, "主页面未定位");
+    }
+    if (bgId) bu(["close_page", "--session", sessionId, bgId]);
+  } catch (e) {
+    ok("DEC-033 select_page 实际前台化所选页", false, e.message.slice(0, 180));
+  }
+  try {
+    bu(["list_pages", "--session", sessionId]);
+    const mainId = pageIdForUrl(sessionId, d33Main);
+    if (mainId) bu(["select_page", "--session", sessionId, mainId, "--bringToFront"]);
+  } catch { /* */ }
+
+  // Oracle: derived——非工具入口创建后台页；CDP background=true 明确声明模拟真实后台 popup。
+  try {
+    await createBackgroundTarget(debugPort, d33Popup, d33Main);
+    const popupId = pageIdForUrl(sessionId, d33Popup);
+    ok("DEC-033 后台 CDP 新页不成为当前页", await waitForActivePage(debugPort, d33Main),
+      `独立活动页机制未观察到 ${d33Main}`);
+    const popupSnap = bu(["take_snapshot", "--session", sessionId]);
+    ok("DEC-033 后台 CDP 新页快照仍读当前页", snapshotDocUrl(popupSnap) === d33Main,
+      `doc=${snapshotDocUrl(popupSnap)}(期望 ${d33Main})`);
+    ok("DEC-033 后台 CDP 新页快照提示包含 page_id+URL",
+      !!popupId && hasPageChangeNotice(popupSnap, popupId, d33Popup),
+      `page_id=${popupId} notice=${popupSnap.split("\n").filter((l) => /page_id|changed|switch|opened|background|unexpected/i.test(l)).join(" || ").slice(0, 180)}`);
+    if (popupId) bu(["close_page", "--session", sessionId, popupId]);
+  } catch (e) {
+    ok("DEC-033 后台 CDP 新页快照提示包含 page_id+URL", false, e.message.slice(0, 180));
+  }
+
+  // Oracle: specified——同标签 URL 导航在下一次快照中必须可见提醒。
+  try {
+    bu(["navigate_page", "--session", sessionId, d33Main]);
+    bu(["navigate_page", "--session", sessionId, d33Nav]);
+    const navId = pageIdForUrl(sessionId, d33Nav);
+    const navSnap = bu(["take_snapshot", "--session", sessionId]);
+    ok("DEC-033 同标签 URL 导航快照提示包含 page_id+URL",
+      !!navId && snapshotDocUrl(navSnap) === d33Nav && hasPageChangeNotice(navSnap, navId, d33Nav),
+      `page_id=${navId} doc=${snapshotDocUrl(navSnap)} notice=${navSnap.split("\n").filter((l) => /page_id|changed|navigat|unexpected/i.test(l)).join(" || ").slice(0, 180)}`);
+  } catch (e) {
+    ok("DEC-033 同标签 URL 导航快照提示包含 page_id+URL", false, e.message.slice(0, 180));
+  }
+
+  // Oracle: specified——显式 new_page 已知目标，不再重复"意外变化"提示。
+  try {
+    bu(["new_page", "--session", sessionId, d33Explicit]);
+    const explicitSnap = bu(["take_snapshot", "--session", sessionId]);
+    const explicitPages = readPages(sessionId);
+    const explicitPage = explicitPages.find((p) => p.url === d33Explicit);
+    ok("DEC-033 显式 new_page 后快照读取新页且无冗余 unexpected 提示",
+      snapshotDocUrl(explicitSnap) === d33Explicit && !!explicitPage && !hasUnexpectedNotice(explicitSnap),
+      `doc=${snapshotDocUrl(explicitSnap)} unexpected=${hasUnexpectedNotice(explicitSnap)}`);
+    if (explicitPage) bu(["close_page", "--session", sessionId, explicitPage.page_id]);
+  } catch (e) {
+    ok("DEC-033 显式 new_page 后快照读取新页且无冗余 unexpected 提示", false, e.message.slice(0, 180));
+  }
+
+  // Oracle: derived——旧页唯一请求由 fixture 发起；切回后该页 listen 缓冲仍可取。
+  try {
+    bu(["navigate_page", "--session", sessionId, d33NetworkOld]);
+    await waitForActivePage(debugPort, d33NetworkOld);
+    bu(["list_network_requests", "--session", sessionId, "--output-format=json"]); // 开启/排空旧页监听
+    snap = bu(["take_snapshot", "--session", sessionId]);
+    const netBtn = parseSnapUid(snap, "旧页请求后开新窗口");
+    ok("DEC-033 旧页请求按钮取得 uid", !!netBtn,
+      snap.split("\n").filter((l) => l.includes("旧页请求")).join(" || ").slice(0, 160));
+    if (netBtn) {
+      bu(["click", "--session", sessionId, netBtn]);
+      const childUrl = await waitForActivePagePrefix(debugPort, d33NetworkChildPrefix);
+      ok("DEC-033 旧页按钮打开并跟随前台新页", !!childUrl, `active=${childUrl}`);
+      const childToken = childUrl ? new URL(childUrl).searchParams.get("dec033_net") : null;
+      let childEarlyFound = false;
+      let childEarlyDetail = "";
+      for (let i = 0; i < 10 && !childEarlyFound && childToken; i++) {
+        const childNet = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--output-format=json"]));
+        const urls = (childNet.requests ?? []).map((r) => r.url);
+        childEarlyFound = urls.some((u) => String(u).includes("dec033_early=") && String(u).includes(childToken));
+        childEarlyDetail = `token=${childToken} urls=${JSON.stringify(urls.slice(-4))}`;
+        if (!childEarlyFound) await new Promise((r) => setTimeout(r, 200));
+      }
+      ok("DEC-033 跟随新页后可见新页首包", childEarlyFound, childEarlyDetail);
+      const oldId = pageIdForUrl(sessionId, d33NetworkOld);
+      if (oldId) bu(["select_page", "--session", sessionId, oldId]);
+      const token = JSON.parse(bu(["evaluate_script", "--session", sessionId,
+        "() => window.__buLastNetworkToken", "--output-format=json"])).value;
+      let netFound = false;
+      let netDetail = "";
+      for (let i = 0; i < 10 && !netFound && token; i++) {
+        const net = JSON.parse(bu(["list_network_requests", "--session", sessionId, "--output-format=json"]));
+        const urls = (net.requests ?? []).map((r) => r.url);
+        netFound = urls.some((u) => String(u).includes(String(token)));
+        netDetail = `token=${token} urls=${JSON.stringify(urls.slice(-4))}`;
+        if (!netFound) await new Promise((r) => setTimeout(r, 200));
+      }
+      ok("DEC-033 切回旧页后保留旧页唯一网络请求", netFound, netDetail);
+      const child = readPages(sessionId).find((p) => p.url.startsWith(d33NetworkChildPrefix));
+      if (child) bu(["close_page", "--session", sessionId, child.page_id]);
+    } else {
+      ok("DEC-033 切回旧页后保留旧页唯一网络请求", false, "请求按钮 uid 未取得");
+    }
+  } catch (e) {
+    ok("DEC-033 切回旧页后保留旧页唯一网络请求", false, e.message.slice(0, 180));
+  }
 
   // ---- 13. stop(完整删除口径:session 目录 + profile 一律不留) ----
   console.log("\n[13] 收尾");

@@ -164,7 +164,7 @@ Every tool command requires `--session=<id>` (the id printed by `start`). The si
 | `list_pages` | Lists open pages. | | |
 | `navigate_page` | Navigates: URL, back, forward, reload. | `[url]` `--type` `--ignoreCache` `--timeout` `--initScript` `--handleBeforeUnload` | `url` applies only to `--type url` (the default). Default URL budget is 20 s (`--timeout` overrides); slow pages return an "Unable to navigate" message rather than hanging. |
 | `new_page` | Opens a new tab. | `<url>` `--background` `--isolatedContext` `--timeout` | Returns the new page id. |
-| `select_page` | Selects the page for future tool calls; page tools otherwise follow the active tab, and an actual active-tab change takes precedence. | `<page_id>` `--bringToFront` | |
+| `select_page` | Selects the page, brings it to the browser foreground, and routes future tool calls there; a later active-tab change takes precedence. | `<page_id>` `--bringToFront` | |
 | `wait_for` | Waits for text to appear. | `<text>` `--timeout` | Searches the main document and all frames. |
 
 ### Emulation (2 tools)

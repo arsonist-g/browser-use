@@ -32,7 +32,7 @@ browser-use fill --session=<id> "3_2" "hello"
 browser-use stop --session=<id>            # closes Edge, deletes the one-off profile
 ```
 
-Each session is an isolated Edge instance with a disposable profile; `--session=<id>` routes every command, so concurrent AI windows never share a browser. Cookies are read from your daily browser at `start`, never written back to it. Page-scoped tools follow the browser's active tab, including tabs opened by a click and tabs the user switches to manually. `select_page` can temporarily route to a background tab; an actual active-tab change takes precedence.
+Each session is an isolated Edge instance with a disposable profile; `--session=<id>` routes every command, so concurrent AI windows never share a browser. Cookies are read from your daily browser at `start`, never written back to it. Page-scoped tools follow the browser's active tab, including tabs opened by a click and tabs the user switches to manually. `select_page` brings the chosen page to the browser foreground and routes future calls there; a later active-tab change takes precedence.
 
 ## Install as an agent skill
 

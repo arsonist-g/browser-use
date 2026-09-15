@@ -28,6 +28,7 @@
   <span id="drag-src" style="display:inline-block;padding:4px 10px;border:1px solid #999;user-select:none;">拖拽源</span>
   <a id="link-iana" href="https://www.iana.org/help/example-domains">外链</a>
   <a id="link-newtab" href="child.html" target="_blank">新窗口打开子页</a>
+  <button id="btn-request-newtab" onclick="requestThenOpenTab()">旧页请求后开新窗口</button>
 </section>
 
 <section id="sec-form">
@@ -91,6 +92,17 @@
 function log(msg) {
   const el = document.getElementById('log');
   el.textContent += (el.textContent === '(空)' ? '' : ' | ') + msg;
+}
+
+function requestThenOpenTab() {
+  const token = `dec033-net-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  window.__buLastNetworkToken = token;
+  log('network-request-started=' + token);
+  const req = new XMLHttpRequest();
+  req.open('GET', `/tick?dec033_net=${encodeURIComponent(token)}`, true);
+  req.send();
+  const child = window.open(`child.html?dec033_net=${encodeURIComponent(token)}&dec033_early=1`, '_blank');
+  if (child) child.focus();
 }
 
 // shadow root(open)

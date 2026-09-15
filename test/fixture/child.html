@@ -3,6 +3,17 @@
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>BU Fixture 子页</title></head>
 <body>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const token = params.get('dec033_net');
+  if (params.get('dec033_early') === '1' && token) {
+    const req = new XMLHttpRequest();
+    req.open('GET', `/tick?dec033_early=${encodeURIComponent(token)}`, true);
+    req.send();
+  }
+})();
+</script>
 <h2>子页</h2>
 <button id="child-btn" onclick="document.getElementById('child-log').textContent='child-clicked'">子页按钮</button>
 <div id="child-log">(child 未点击)</div>
