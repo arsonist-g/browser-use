@@ -63,6 +63,7 @@ class BrowserSession:
         self.webmcp_enabled = "--enable-features=WebMCP" in self.extra_flags
         self.browser = None
         self.tab = None
+        self._last_active_tab_id = None
         # 页内工具共用状态
         self.listen_started = False
         self.console_started = False
@@ -110,6 +111,7 @@ class BrowserSession:
         self.tab = self.browser.latest_tab
         self.prune_edge_popups()
         self.tab = self.browser.latest_tab
+        self._last_active_tab_id = getattr(self.tab, "tab_id", None)
         # 会话级监听尽早开启(listen/console 只捕开启后的事件)
         try:
             self.tab.listen.start()
@@ -149,19 +151,28 @@ class BrowserSession:
 
     @property
     def t(self):
-        # 固定主任务 tab:Edge 会中途弹 sync 确认页抢占 latest_tab,不能跟随。
-        # 注意:DP 的 get_tabs() 每次返回全新 tab 对象(无 __eq__,身份比较永不匹配),
-        # 若据此换对象,tab 级状态(listen 监听等)会每次访问都丢——必须按 tab_id 比对复用。
+        # 页面工具以浏览器活动标签页为准:AI 点击 target=_blank 打开的前台新页与
+        # 用户手工切换都必须被跟随。DP 的 get_tabs() 每次返回全新对象,按 tab_id
+        # 复用列表中的对象,避免 tab 级 listen/console 状态丢失。
         tabs = self.browser.get_tabs()
         if not tabs:
             return self.tab
+        active = tabs[0]
+        active_id = getattr(active, "tab_id", None)
+        if active_id is not None and active_id != self._last_active_tab_id:
+            self.tab = active
+        self._last_active_tab_id = active_id
+
         cur_id = getattr(self.tab, "tab_id", None)
-        if cur_id is not None and any(tb.tab_id == cur_id for tb in tabs):
-            return self.tab
-        # 选中页已被关闭:对齐 cdt getSelectedMcpPage 语义——page 工具立即报错引导
-        # list_pages,不静默换页(静默回退会让 AI 在错误的页上继续操作);
-        # 恢复走 list_pages(自动回退 + 提示行)或 select_page。
-        raise ValueError("The selected page has been closed. Call list_pages to see open pages.")
+        if cur_id is not None:
+            current = next((tb for tb in tabs if getattr(tb, "tab_id", None) == cur_id), None)
+            if current is not None:
+                self.tab = current
+                return current
+        # 当前选择页已关闭/尚未选择:浏览器解析出的活动页直接接管,不再要求
+        # list_pages 先显式恢复(当前需求覆盖旧的 selected-page-closed 语义)。
+        self.tab = active
+        return active
 
     def _whitelist_paths(self):
         """白名单扩展目录(Should 机制;首版无实现,恒空 = 全禁扩展)。"""
@@ -213,6 +224,8 @@ class BrowserSession:
         if idx < 0 or idx >= len(tabs):
             raise ValueError("No page found")  # 文案对齐 cdt getPageById
         self.tab = tabs[idx]
+        # 选择后台页时同步记录当前活动页;此后只有活动页真实变化才覆盖这次选择。
+        self._last_active_tab_id = getattr(tabs[0], "tab_id", None)
 
     def stop(self):
         try:

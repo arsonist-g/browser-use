@@ -8,6 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import url from "node:url";
 import fs from "node:fs";
+import { WebSocket } from "ws";
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 const CLI = path.join(ROOT, "bin", "browser-use.mjs");
@@ -39,6 +40,97 @@ function parseSnapUid(text, labelIncludes) {
     }
   }
   return null;
+}
+
+function snapshotDocUrl(text) {
+  const m = text.match(/^doc url="([^"]+)"/m);
+  return m ? m[1] : null;
+}
+
+function readPages(session) {
+  return JSON.parse(bu(["list_pages", "--session", session, "--output-format=json"])).pages;
+}
+
+function pageIdForUrl(session, expectedUrl) {
+  const page = readPages(session).find((p) => p.url === expectedUrl);
+  return page?.page_id ?? null;
+}
+
+function sessionPort(session) {
+  const home = process.env.BROWSER_USE_HOME ?? path.join(os.homedir(), ".browser-use");
+  const doc = JSON.parse(fs.readFileSync(path.join(home, "sessions", session, "session.json"), "utf8"));
+  return doc.port;
+}
+
+async function pageTargets(port) {
+  return (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json())
+    .filter((t) => t.type === "page" && t.url.startsWith("http"));
+}
+
+async function waitForActivePage(port, expectedUrl, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const [active] = await pageTargets(port);
+    if (active?.url === expectedUrl) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  } while (Date.now() < deadline);
+  return false;
+}
+
+function cdpCall(wsUrl, method, params = {}, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch { /* */ }
+      reject(new Error(`CDP timeout: ${method}`));
+    }, timeoutMs);
+    ws.once("open", () => ws.send(JSON.stringify({ id: 1, method, params })));
+    ws.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    ws.on("message", (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.id !== 1) return;
+      clearTimeout(timer);
+      ws.close();
+      if (msg.error) reject(new Error(`CDP ${method}: ${msg.error.message}`));
+      else resolve(msg.result);
+    });
+  });
+}
+
+/** 独立活动页机制:经浏览器 CDP websocket 激活,不经过 select_page。 */
+async function activatePageByUrl(port, expectedUrl) {
+  const target = (await pageTargets(port)).find((t) => t.url === expectedUrl);
+  if (!target) throw new Error(`active-tab target not found: ${expectedUrl}`);
+  const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+  const browserWs = version.webSocketDebuggerUrl;
+  const errors = [];
+  try {
+    const win = await cdpCall(browserWs, "Browser.getWindowForTarget", { targetId: target.id });
+    try {
+      await cdpCall(browserWs, "Browser.setWindowBounds", {
+        windowId: win.windowId, bounds: { windowState: "minimized" },
+      });
+      await cdpCall(browserWs, "Browser.setWindowBounds", {
+        windowId: win.windowId, bounds: { windowState: "normal" },
+      });
+    } catch (e) {
+      errors.push(`Browser.setWindowBounds: ${e.message}`);
+    }
+    await cdpCall(browserWs, "Target.activateTarget", { targetId: target.id });
+  } catch (e) {
+    errors.push(`Target.activateTarget: ${e.message}`);
+  }
+  try {
+    await cdpCall(target.webSocketDebuggerUrl, "Page.bringToFront");
+  } catch (e) {
+    errors.push(`Page.bringToFront: ${e.message}`);
+  }
+  if (!(await waitForActivePage(port, expectedUrl, 3000))) {
+    throw new Error(`active-tab switch not observed: ${expectedUrl}${errors.length ? ` (${errors.join("; ")})` : ""}`);
+  }
 }
 
 /** 安全执行单个 CLI 调用:失败返回 null 并记 fail(不炸整个 run) */
@@ -311,8 +403,99 @@ async function main() {
     catch (e) { ok("中部偏移 iframe 元素截图(smoke)", false, e.message.slice(0, 120)); }
   }
 
-  // ---- 12. stop(完整删除口径:session 目录 + profile 一律不留) ----
-  console.log("\n[12] 收尾");
+  // ---- 12. 页作用域工具跟随浏览器活动标签 ----
+  console.log("\n[12] 活动标签路由");
+  const tabMain = `${BASE}/?tab=main`;
+  const tabBackground = `${BASE}/child.html?tab=background`;
+  const tabManual = `${BASE}/deep.html?tab=manual`;
+  const tabClose = `${BASE}/child.html?tab=close-selected`;
+  const blankUrl = `${BASE}/child.html`;
+  const debugPort = sessionPort(sessionId);
+
+  // Oracle: specified（fixture 的 href/target）——target=_blank 后活动页必须是 child.html。
+  try {
+    bu(["navigate_page", "--session", sessionId, tabMain]);
+    snap = bu(["take_snapshot", "--session", sessionId]);
+    const blankUid = parseSnapUid(snap, "新窗口打开子页");
+    ok("新窗口链接取得 uid", !!blankUid, snap.split("\n").filter((l) => l.includes("新窗口")).join(" || ").slice(0, 160));
+    if (blankUid) {
+      bu(["click", "--session", sessionId, blankUid]);
+      const activeChanged = await waitForActivePage(debugPort, blankUrl);
+      ok("click target=_blank 后浏览器活动页切换", activeChanged,
+        `独立活动页机制未观察到 ${blankUrl}`);
+      snap = bu(["take_snapshot", "--session", sessionId]);
+      ok("click target=_blank 后 take_snapshot 跟随新活动页", snapshotDocUrl(snap) === blankUrl,
+        `doc=${snapshotDocUrl(snap)}(期望 ${blankUrl})`);
+    } else {
+      ok("click target=_blank 后 take_snapshot 跟随新活动页", false, "缺少新窗口链接 uid");
+    }
+  } catch (e) {
+    ok("click target=_blank 后 take_snapshot 跟随新活动页", false, e.message.slice(0, 180));
+  }
+  try {
+    const blankId = pageIdForUrl(sessionId, blankUrl);
+    if (blankId) bu(["close_page", "--session", sessionId, blankId]);
+    const mainId = pageIdForUrl(sessionId, tabMain);
+    if (mainId) bu(["select_page", "--session", sessionId, mainId]);
+  } catch { /* 后续用例会重新建立页面状态 */ }
+
+  // Oracle: specified + derived——显式选择后台页应保持；独立 CDP 活动页变化应覆盖它。
+  try {
+    bu(["navigate_page", "--session", sessionId, tabMain]);
+    bu(["new_page", "--session", sessionId, tabBackground]);
+    bu(["new_page", "--session", sessionId, tabManual]);
+    await activatePageByUrl(debugPort, tabMain);
+    const backgroundId = pageIdForUrl(sessionId, tabBackground);
+    ok("后台页可从 list_pages 定位", !!backgroundId, `backgroundId=${backgroundId}`);
+    if (backgroundId) {
+      bu(["select_page", "--session", sessionId, backgroundId]);
+      snap = bu(["take_snapshot", "--session", sessionId]);
+      ok("显式 select_page 后 take_snapshot 读取所选后台页", snapshotDocUrl(snap) === tabBackground,
+        `doc=${snapshotDocUrl(snap)}(期望 ${tabBackground})`);
+      await activatePageByUrl(debugPort, tabManual);
+      snap = bu(["take_snapshot", "--session", sessionId]);
+      ok("浏览器活动标签变化覆盖显式选择", snapshotDocUrl(snap) === tabManual,
+        `doc=${snapshotDocUrl(snap)}(期望 ${tabManual})`);
+    } else {
+      ok("显式 select_page 后 take_snapshot 读取所选后台页", false, "后台页未定位");
+      ok("浏览器活动标签变化覆盖显式选择", false, "后台页未定位");
+    }
+  } catch (e) {
+    ok("显式 select_page 后 take_snapshot 读取所选后台页", false, e.message.slice(0, 180));
+    ok("浏览器活动标签变化覆盖显式选择", false, e.message.slice(0, 180));
+  }
+  try {
+    for (const u of [tabBackground, tabManual]) {
+      const id = pageIdForUrl(sessionId, u);
+      if (id) bu(["close_page", "--session", sessionId, id]);
+    }
+    bu(["list_pages", "--session", sessionId]);
+    const mainId = pageIdForUrl(sessionId, tabMain);
+    if (mainId) bu(["select_page", "--session", sessionId, mainId]);
+  } catch { /* 后续用例会重新建立页面状态 */ }
+
+  // Oracle: derived——关闭选中页后，take_snapshot 必须匹配独立机制解析出的活动页。
+  try {
+    bu(["navigate_page", "--session", sessionId, tabMain]);
+    const created = JSON.parse(bu(["new_page", "--session", sessionId, tabClose, "--output-format=json"]));
+    ok("关闭场景的新页成为当前选中页", created.url === tabClose, `url=${created.url}`);
+    bu(["close_page", "--session", sessionId, created.page_id]);
+    const recoveredActive = await waitForActivePage(debugPort, tabMain);
+    ok("关闭选中页后浏览器解析到新活动页", recoveredActive, `独立活动页机制未观察到 ${tabMain}`);
+    snap = bu(["take_snapshot", "--session", sessionId]);
+    ok("关闭选中页后 take_snapshot 跟随新活动页", snapshotDocUrl(snap) === tabMain,
+      `doc=${snapshotDocUrl(snap)}(期望 ${tabMain})`);
+  } catch (e) {
+    ok("关闭选中页后 take_snapshot 跟随新活动页", false, e.message.slice(0, 180));
+  }
+  try {
+    bu(["list_pages", "--session", sessionId]);
+    const mainId = pageIdForUrl(sessionId, tabMain);
+    if (mainId) bu(["select_page", "--session", sessionId, mainId]);
+  } catch { /* 收尾不依赖该恢复 */ }
+
+  // ---- 13. stop(完整删除口径:session 目录 + profile 一律不留) ----
+  console.log("\n[13] 收尾");
   out = bu(["stop", "--session", sessionId]);
   ok("stop → cleaned", out.includes("state=cleaned"), out.slice(0, 120));
   const buHome = process.env.BROWSER_USE_HOME ?? path.join(os.homedir(), ".browser-use");

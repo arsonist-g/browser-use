@@ -6,6 +6,7 @@ import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import url from "node:url";
 import fs from "node:fs";
+import os from "node:os";
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 const CLI = path.join(ROOT, "bin", "browser-use.mjs");
@@ -31,6 +32,18 @@ function parseSnapUid(text, labelIncludes) {
     if (line.includes(labelIncludes)) { const m = line.match(/uid=(\d+_\d+)/); if (m) return m[1]; }
   }
   return null;
+}
+
+function snapshotDocUrl(text) {
+  const m = text.match(/^doc url="([^"]+)"/m);
+  return m ? m[1] : null;
+}
+
+async function activePageUrl(session) {
+  const home = process.env.BROWSER_USE_HOME ?? path.join(os.homedir(), ".browser-use");
+  const doc = JSON.parse(fs.readFileSync(path.join(home, "sessions", session, "session.json"), "utf8"));
+  const targets = await (await fetch(`http://127.0.0.1:${doc.port}/json/list`)).json();
+  return targets.find((t) => t.type === "page" && t.url.startsWith("http"))?.url ?? null;
 }
 
 const serverProc = spawn(process.platform === "win32" ? "python" : "python3",
@@ -730,19 +743,18 @@ async function main() {
       goneMsg ? goneMsg.slice(0, 100) : "卸载后状态仍可查");
   } catch (e) { mark("uninstall_pwa", "FAIL", e.message.slice(0, 120)); }
 
-  // ========== 选中页关闭语义(cdt 同:page 工具报错引导 list_pages;list_pages 自动回退 + 提示行) ==========
+  // ========== 选中页关闭语义(DEC-032:关闭后直接跟随浏览器解析出的活动页) ==========
   try {
     const pg = JSON.parse(bu(["new_page", "--session", sessionId, `${BASE}/child.html`, "--output-format=json"]));
     bu(["select_page", "--session", sessionId, pg.page_id]);
-    // 关闭当前选中页(page_id = 最后一个)
     bu(["close_page", "--session", sessionId, pg.page_id]);
+    const expectedActive = await activePageUrl(sessionId);
     const after = tryBu(["take_snapshot", "--session", sessionId]);
-    const closedOk = !after.ok && /selected page has been closed/i.test(after.out);
-    const lp = bu(["list_pages", "--session", sessionId, "--output-format=json"]);
-    const noteOk = /previously selected page was closed/.test(lp);
-    const recovered = (() => { try { bu(["take_snapshot", "--session", sessionId]); return true; } catch { return false; } })();
-    mark("选中页关闭语义", closedOk && noteOk && recovered ? "PASS" : "FAIL",
-      `closed报错=${closedOk} 回退提示=${noteOk} 恢复可用=${recovered}`);
+    const actual = after.ok ? snapshotDocUrl(after.out) : null;
+    const followedActive = after.ok && !!expectedActive && actual === expectedActive
+      && expectedActive !== `${BASE}/child.html`;
+    mark("选中页关闭语义", followedActive ? "PASS" : "FAIL",
+      `active=${expectedActive} snapshot=${actual} ok=${after.ok}`);
   } catch (e) { mark("选中页关闭语义", "FAIL", e.message.slice(0, 140)); }
 
   // ========== new_page(isolatedContext)——置于矩阵尾部:Edge 152 headless 下

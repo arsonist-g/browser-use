@@ -32,7 +32,7 @@ browser-use fill --session=<id> "3_2" "hello"
 browser-use stop --session=<id>            # 关闭 Edge,删除一次性 profile
 ```
 
-每个会话是带一次性 profile 的独立 Edge 实例;`--session=<id>` 路由每条命令,并发的 AI 窗口永不共享浏览器。cookie 在 `start` 时从日常浏览器读取,永不回写。
+每个会话是带一次性 profile 的独立 Edge 实例;`--session=<id>` 路由每条命令,并发的 AI 窗口永不共享浏览器。cookie 在 `start` 时从日常浏览器读取,永不回写。页面级工具跟随浏览器活动标签页:点击打开的新前台标签页和用户手工切换的标签页都会生效。`select_page` 可临时路由到后台页;浏览器活动标签页发生真实变化时,以活动页为准。
 
 ## 安装为 agent skill
 
