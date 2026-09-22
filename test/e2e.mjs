@@ -3,7 +3,7 @@
 // 用法: node test/e2e.mjs [--headed](默认 headless)
 // 前置: 桥扩展已装且日常浏览器打开(login 断言在桥离线时自动 SKIP)
 // 退出码: 0 = 全过;1 = 有 fail(fail 明细列在汇总)
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFileSync, spawnSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import url from "node:url";
@@ -30,6 +30,21 @@ function bu(args, timeoutMs = 60000) {
   return execFileSync(process.execPath, [CLI, ...args], {
     encoding: "utf8", timeout: timeoutMs, env: { ...process.env },
   });
+}
+
+// 失败路径要用退出码与错误码本身做断言:execFileSync 遇非 0 退出即抛,这里自己收
+function buTry(args, timeoutMs = 60000) {
+  const r = spawnSync(process.execPath, [CLI, ...args], {
+    encoding: "utf8", timeout: timeoutMs, env: { ...process.env },
+  });
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+// 错误码断言取 JSON(stdout)优先,JSON 缺失时退回 stderr 的 error[CODE] 行
+function errorCodeOf(r) {
+  try { return JSON.parse(r.stdout).error?.code ?? null; } catch { /* 非 JSON */ }
+  const m = /error\[([A-Z_]+)\]/.exec(r.stderr);
+  return m ? m[1] : null;
 }
 
 function parseSnapUid(text, labelIncludes) {
@@ -281,10 +296,34 @@ async function main() {
   // ---- 6. 动态重建(uid 失效防护) ----
   console.log("\n[6] 动态重建");
   const rebuildUid = parseSnapUid(snap, "重建列表");
+  const staleUid = parseSnapUid(snap, "item-a");   // 重建前持有的引用:重建后必然失效
   bu(["click", "--session", sessionId, rebuildUid]);
   snap = bu(["take_snapshot", "--session", sessionId]);
   ok("重建后新内容可见(rebuilt-0)", snap.includes("rebuilt-0"));
   ok("重建后 log 记录", snap.includes("list-rebuilt"));
+
+  // ---- 6.5 错误契约:失效引用与工具级超时都不得被协议层/传输层抢走真原因 ----
+  console.log("\n[6.5] 错误契约");
+  if (staleUid) {
+    const stale = buTry(["click", "--session", sessionId, staleUid, "--output-format=json"]);
+    ok("失效 uid → STATE_EXPIRED(退出码 5,可重试;不是 CDP_ERROR)",
+      stale.status === 5 && errorCodeOf(stale) === "STATE_EXPIRED",
+      `exit=${stale.status} code=${errorCodeOf(stale)} err=${(stale.stderr || stale.stdout).trim().slice(0, 160)}`);
+  } else {
+    ok("失效 uid → STATE_EXPIRED(退出码 5,可重试;不是 CDP_ERROR)", false, "重建前未取到 item-a 的 uid");
+  }
+  const tWait = Date.now();
+  const waitMiss = buTry(["wait_for", "--session", sessionId, "e2e-不会出现的文本",
+    "--timeout=1500", "--output-format=json"]);
+  const waitWall = Date.now() - tWait;
+  ok("wait_for 未命中 → TIMEOUT(不是传输层 CORE_TIMEOUT)",
+    waitMiss.status === 5 && errorCodeOf(waitMiss) === "TIMEOUT",
+    `exit=${waitMiss.status} code=${errorCodeOf(waitMiss)} wall=${waitWall}ms err=${(waitMiss.stderr || waitMiss.stdout).trim().slice(0, 160)}`);
+  ok("工具级预算先于传输层到点(不在 +5s 余量处才被杀)", waitWall < 1500 + 4000, `wall=${waitWall}ms`);
+  const emu = buTry(["emulate", "--session", sessionId, "--userAgent=red-line-probe/1.0", "--output-format=json"]);
+  ok("emulate 红线维度 → UNSUPPORTED(不得静默 done)",
+    emu.status === 2 && errorCodeOf(emu) === "UNSUPPORTED",
+    `exit=${emu.status} code=${errorCodeOf(emu)} err=${(emu.stderr || emu.stdout).trim().slice(0, 160)}`);
 
   // ---- 7. 滚动与懒加载(分步滚,避免 scrollBy 瞬移跳过 IntersectionObserver 哨兵) ----
   console.log("\n[7] 滚动与懒加载");
@@ -697,6 +736,82 @@ async function main() {
      "profile 仍存在");
   const listed = bu(["sessions", "list", "--output-format=json"]);
   ok("session list 不含已 stop 会话", !listed.includes(sessionId));
+
+  // ---- 14. port-only 会话:降级态的通道契约 ----
+  console.log("\n[14] port-only 会话通道");
+  await portOnlySection();
+}
+
+// port-only(无 pipe)形态只在异常环境自然出现(浏览器自我重启丢失 fd 3/4),
+// 用测试钩子隔离 home + 隔离 daemon 强制降级,回归降级态的通道契约:
+// 隔离上下文仍可用(Target 域走浏览器级 ws),PWA 工具按 PIPE_UNAVAILABLE 如实上报。
+async function portOnlySection() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bu-portonly-home-"));
+  const daemonPort = 27985;
+  const env = {
+    ...process.env, BROWSER_USE_HOME: home, BU_DAEMON_PORT: String(daemonPort),
+    BU_DEV_FORCE_PORT_ONLY: "1",
+  };
+  const run = (args, timeoutMs = 120000) => spawnSync(process.execPath, [CLI, ...args],
+    { encoding: "utf8", timeout: timeoutMs, env });
+  let poSession = null;
+  let liveBrowser = false;
+  try {
+    // 隔离 home 自带端口段与桥端口:否则两个 daemon 会各自认领同一批端口
+    fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({
+      port_range: [18450, 18500], daemon_http_port: daemonPort, bridge_ws_port: 17997,
+    }));
+    const st = run(["status", "--output-format=json"]);
+    ok("port-only daemon 起在隔离 home", st.status === 0, (st.stderr || "").slice(0, 160));
+    const started = run(["start", "--output-format=json"]);
+    let r = {};
+    try { r = JSON.parse(started.stdout); } catch { /* 断言在下一行给出 */ }
+    poSession = r.session_id ?? null;
+    liveBrowser = !!poSession;
+    ok("port-only 会话启动并自报降级(pipe_available=false + warning)",
+      started.status === 0 && r.pipe_available === false && /port-only/.test(r.warning ?? ""),
+      `status=${started.status} pipe_available=${r.pipe_available} warning=${(r.warning ?? "").slice(0, 140)}`);
+    if (poSession) {
+      const np = run(["new_page", `${BASE}/echo-cookie`, "--isolatedContext=e2e-iso",
+        "--session", poSession, "--output-format=json"]);
+      let npj = {};
+      try { npj = JSON.parse(np.stdout); } catch { /* */ }
+      ok("port-only 会话下 new_page --isolatedContext 可用(走浏览器级 ws)",
+        np.status === 0 && String(npj.url ?? "").startsWith(`${BASE}/echo-cookie`),
+        `status=${np.status} url=${npj.url} err=${(np.stderr || np.stdout).trim().slice(0, 160)}`);
+      const ext = run(["list_extensions", "--session", poSession, "--output-format=json"]);
+      ok("port-only 会话下 Extensions 工具可用", ext.status === 0,
+        `status=${ext.status} err=${(ext.stderr || ext.stdout).trim().slice(0, 160)}`);
+      const pwa = run(["launch_pwa", "--manifestId=e2e-nonexistent", "--session", poSession,
+        "--output-format=json"]);
+      ok("port-only 会话下 PWA 工具报 PIPE_UNAVAILABLE(不谎报 CDP_ERROR)",
+        pwa.status === 4 && errorCodeOf(pwa) === "PIPE_UNAVAILABLE",
+        `exit=${pwa.status} code=${errorCodeOf(pwa)} err=${(pwa.stderr || pwa.stdout).trim().slice(0, 160)}`);
+      const stopped = run(["stop", "--session", poSession]);
+      ok("port-only 会话可正常 stop", stopped.stdout.includes("state=cleaned"), stopped.stdout.slice(0, 120));
+      poSession = null;
+    }
+  } finally {
+    if (poSession) { try { run(["stop", "--session", poSession], 30000); } catch { /* */ } }
+    try {
+      const pid = Number(fs.readFileSync(path.join(home, "daemon.pid"), "utf8").trim());
+      if (pid) process.kill(pid);   // Windows 上等同强杀:daemon 不会自己收尾
+    } catch { /* 未起或已退出 */ }
+    if (liveBrowser && fs.existsSync(path.join(home, "profiles"))) {
+      // 强杀 daemon 可能留下它自托管的浏览器:按本次 home 路径精确清扫,不碰别人的 Edge
+      const escaped = home.replace(/'/g, "''");
+      spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+        `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object ` +
+        `{ $_.CommandLine -like '*${escaped}*' } | ForEach-Object ` +
+        `{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
+      { stdio: "ignore", windowsHide: true });
+    }
+    await new Promise((r) => setTimeout(r, 800));
+    for (let i = 0; i < 3; i++) {
+      try { fs.rmSync(home, { recursive: true, force: true }); break; }
+      catch { await new Promise((r) => setTimeout(r, 500)); }
+    }
+  }
 }
 
 try {

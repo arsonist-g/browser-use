@@ -8,6 +8,7 @@ import time
 from DrissionPage import Chromium, ChromiumOptions
 
 from .cdp_events import BrowserNetworkRecorder
+from .errors import InternalFailure, NotFoundError, StateExpiredError
 
 # console.* 捕获 hook:Console 域在新版 Edge/Chrome 不再派发事件(实测 enable 成功但 0 事件),
 # 而 Runtime.enable 属红线(CONSTRAINT-001)。改为 addScriptToEvaluateOnNewDocument 注入透传
@@ -47,6 +48,18 @@ def install_console_hook(tab):
         tab.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=_CONSOLE_HOOK_JS)
     except Exception:
         pass
+
+
+# 浏览器内建页(下载中心/欢迎页/设置等)是浏览器 UI,不是任务页:页面级工具(快照/网络/
+# 滚动)落在上面只会误导 AI。实测:点击触发的下载会让 Edge 前置 edge://downloads-hub/,
+# 且 Target.closeTarget 与 HTTP /json/close 都关不掉它(CHROMIUM 接受请求,页面仍在)。
+# 因此"当前页跟随"跳过内建页(显式 select_page 仍可选中),prune 继续尽力关掉。
+_BUILTIN_PAGE_PREFIXES = ("edge://", "chrome://", "about:", "edge-netinternal://", "devtools://")
+
+
+def is_builtin_page(url):
+    """该 url 是否指向浏览器内建页(非任务页)。"""
+    return str(url or "").lower().startswith(_BUILTIN_PAGE_PREFIXES)
 
 
 class BrowserSession:
@@ -196,6 +209,20 @@ class BrowserSession:
                 return i
         return None
 
+    def _pick_active(self, ids, urls, previous_active_id):
+        """当前页归属:浏览器活动页(列表首位)优先,但内建页永不自动成为当前页。
+
+        内建页被前置时保持原当前页(它是 AI 的任务上下文);原页已关则退到第一个任务页。
+        """
+        if not is_builtin_page(urls[0]):
+            return ids[0]
+        if previous_active_id in ids:
+            return previous_active_id
+        for i, u in enumerate(urls):
+            if not is_builtin_page(u):
+                return ids[i]
+        return ids[0]
+
     def observe_page_changes(self, announce=True):
         """观察浏览器活动页/新页/URL 变化,并在下一次快照前累积提醒。"""
         try:
@@ -209,8 +236,8 @@ class BrowserSession:
         urls = [self._tab_url(tb) for tb in tabs]
         if not any(ids):
             return
-        active_id = ids[0]
         previous_active_id = self._last_active_tab_id
+        active_id = self._pick_active(ids, urls, previous_active_id)
         new_ids = [tid for tid in ids if tid not in self._known_tab_ids]
         active_changed = active_id != previous_active_id
         if announce:
@@ -218,7 +245,12 @@ class BrowserSession:
                 idx = self._tab_index(tabs, tid)
                 if idx is None:
                     continue
-                if tid == active_id:
+                if is_builtin_page(urls[idx]):
+                    # 内建页本就可被浏览器前置:明说它不是任务页,当前页不因此漂移
+                    self._pending_page_notices.append(
+                        f"notice: Browser-internal page opened: page_id={idx}, url={urls[idx]} "
+                        f"(browser UI, not a task page; the selected page is unchanged)")
+                elif tid == active_id:
                     self._pending_page_notices.append(
                         f"notice: New page opened and became active: page_id={idx}, url={urls[idx]}")
                 else:
@@ -241,7 +273,8 @@ class BrowserSession:
                     self._pending_page_notices.append(
                         f"notice: Page page_id={idx} navigated to {urls[idx]}")
         if active_changed or self.tab is None or self._raw_tab_id(self.tab) not in ids:
-            self.tab = tabs[0]
+            idx = self._tab_index(tabs, active_id)
+            self.tab = tabs[idx] if idx is not None else tabs[0]
         self._known_tab_ids = set(ids)
         self._tab_urls = dict(zip(ids, urls, strict=True))
         self._last_active_tab_id = active_id
@@ -271,7 +304,7 @@ class BrowserSession:
         """显式选页的硬语义:浏览器活动页必须与驱动当前页一致。"""
         tid = self._raw_tab_id(tab)
         if not tid:
-            raise RuntimeError("selected page has no target id")
+            raise StateExpiredError("selected page has no target id")
         if self._active_tab_id() == tid:
             self.tab = tab
             return
@@ -315,7 +348,8 @@ class BrowserSession:
                 self.tab = tab
                 return
             time.sleep(0.05)
-        raise RuntimeError("Failed to bring selected page to the browser foreground")
+        raise InternalFailure("Failed to bring selected page to the browser foreground"
+                              "(页面仍可操作,但前台顺序不保证)")
 
     def _whitelist_paths(self):
         """白名单扩展目录(Should 机制;首版无实现,恒空 = 全禁扩展)。"""
@@ -327,8 +361,7 @@ class BrowserSession:
         依赖 targetDestroyed 事件清理 driver 注册表,事件丢失时无限等待(实测挂死)。"""
         try:
             for t in self.browser.get_tabs():
-                u = (t.url or "").lower()
-                if u.startswith(("edge://", "chrome://", "about:", "edge-netinternal://")):
+                if is_builtin_page(t.url):
                     tabs = self.browser.get_tabs()
                     if len(tabs) > 1:
                         tab_id = t.tab_id
@@ -359,15 +392,19 @@ class BrowserSession:
             return None
         if self.tab is None:
             return None
-        self.tab = self._register_tab(tabs[0])
+        # 回退目标同样跳过内建页:回退到浏览器 UI 上,页面级工具就又在对着非任务页工作
+        ids = [self._raw_tab_id(tb) for tb in tabs]
+        urls = [self._tab_url(tb) for tb in tabs]
+        idx = self._tab_index(tabs, self._pick_active(ids, urls, None))
+        self.tab = self._register_tab(tabs[0 if idx is None else idx])
         self._last_active_tab_id = self._raw_tab_id(self.tab)
-        return "Note: the previously selected page was closed. Page 0 is now selected."
+        return f"Note: the previously selected page was closed. Page {0 if idx is None else idx} is now selected."
 
     def select_page(self, page_id):
         tabs = self.browser.get_tabs()
         idx = int(page_id)
         if idx < 0 or idx >= len(tabs):
-            raise ValueError("No page found")  # 文案对齐 cdt getPageById
+            raise NotFoundError("No page found")  # 文案对齐 cdt getPageById
         target = self._register_tab(tabs[idx])
         self._activate_tab(target)
         self.tab = target

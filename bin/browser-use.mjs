@@ -7,6 +7,10 @@ import path from "node:path";
 import fs from "node:fs";
 import url from "node:url";
 
+import { ERROR_CODES, exitCodeFor } from "../lib/error-codes.mjs";
+import { cliRpcTimeoutMs, toolBudgetMs } from "../lib/budget.mjs";
+import { loadConfig } from "../lib/config.mjs";
+
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 // 版本号单一来源 = package.json(此前硬编码曾连续两版未同步)
 const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
@@ -16,7 +20,7 @@ const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf
 // (只服务测试,不写进 SKILL.md)
 const DEV_HEADLESS = process.env.BU_DEV_ALLOW_HEADLESS === "1";
 
-// ---- 工具位置参数表(P0;M2/M3 占位工具原样转发 flags) ----
+// ---- 工具位置参数表(未列出的 flag 原样转发到 core) ----
 const TOOL_POS = {
   click: ["uid"], fill: ["uid", "value"], hover: ["uid"], drag: ["from_uid", "to_uid"],
   press_key: ["key"], type_text: ["text"], upload_file: ["uid", "filePaths"],
@@ -44,12 +48,17 @@ function outJson(obj) { out(JSON.stringify(obj, null, 2)); }
 // 会在 flush 前终止进程,Windows 上错误输出随机丢失——AI 消费面拿不到错误原因
 function errOut(text) { try { fs.writeSync(2, text); } catch { /* 关闭中 */ } }
 function die(code, msg) { errOut(`error: ${msg}\n`); process.exit(code); }
+// 用法错统一带错误码:AI 侧只看得到"码 + 正文 + 退出码",码必须指向真原因
+function dieUsage(msg) { errOut(`error[INVALID_ARG]: ${msg}\n`); process.exit(ERROR_CODES.INVALID_ARG.exit); }
+// daemon 端口单一来源:CLI 的每条 HTTP 路径(请求 / 探活 / 状态 / 报错文案)必须问同一个端口。
+// 有一处写死默认值,用 BU_DAEMON_PORT 起隔离 daemon 时那条路径就会打到别人的 daemon 上
+const daemonPort = () => Number(process.env.BU_DAEMON_PORT ?? 17981);
 
 function rpc(op, payload, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ v: 1, id: `r-${Math.random().toString(36).slice(2)}`, op, payload });
     const req = http.request({
-      host: "127.0.0.1", port: Number(process.env.BU_DAEMON_PORT ?? 17981),
+      host: "127.0.0.1", port: daemonPort(),
       path: "/rpc", method: "POST",
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
       timeout: timeoutMs,
@@ -73,8 +82,8 @@ function rpc(op, payload, timeoutMs = 60000) {
 
 function daemonAlive() {
   return new Promise((resolve) => {
-    const req = http.get({ host: "127.0.0.1", port: Number(process.env.BU_DAEMON_PORT ?? 17981),
-      path: "/health", timeout: 1500 }, (res) => {
+    const req = http.get({ host: "127.0.0.1", port: daemonPort(),
+        path: "/health", timeout: 1500 }, (res) => {
       res.resume();
       resolve(res.statusCode === 200);
     });
@@ -98,7 +107,8 @@ async function ensureDaemon() {
     if (await daemonAlive()) return;
     await new Promise((r) => setTimeout(r, 200));
   }
-  die(3, "daemon 启动超时(检查 node 环境与 ~/.browser-use/daemon.log)");
+  const port = daemonPort();
+  die(3, `daemon 启动超时:127.0.0.1:${port} 无响应(端口被占用或 node 环境异常;daemon 侧原因见 ~/.browser-use/daemon.log)`);
 }
 
 function fmtResult(tool, r) {
@@ -157,10 +167,10 @@ usage:
     return;
   }
   // help 路由:help <tool> → 单工具参数;help → 全部工具与命令;<tool> --help → 单工具参数
-  const { toolHelpText, helpOverviewText } = await import("../lib/tool-help.mjs");
+  const { TOOL_REFERENCE, toolHelpText, helpOverviewText, suggestTools } = await import("../lib/tool-help.mjs");
   if (command === "help" && positionals[0]) {
     const t = toolHelpText(positionals[0]);
-    if (!t) die(2, `未知工具: ${positionals[0]}(browser-use help 列出全部工具)`);
+    if (!t) dieUsage(`未知工具: ${positionals[0]}(browser-use help 列出全部工具)`);
     return out(t);
   }
   if (command === "help") return out(helpOverviewText());
@@ -168,18 +178,26 @@ usage:
     if (toolHelpText(command)) return out(toolHelpText(command));
     const sessionCmds = new Set(["start", "stop", "sessions", "session.bare", "status", "config", "extension", "skill", "allow", "doctor"]);
     if (sessionCmds.has(command)) return out(helpOverviewText());
-    die(2, `未知工具: ${command}(browser-use help 列出全部工具)`);
+    dieUsage(`未知工具: ${command}(browser-use help 列出全部工具)`);
   }
 
   const jsonMode = values["output-format"] === "json";
-  const need = () => { if (!values.session) die(2, "需要 --session=<id>(由 start 输出)"); return values.session; };
+  const need = () => { if (!values.session) dieUsage("需要 --session=<id>(由 start 输出)"); return values.session; };
+  // --timeout 缺省时工具预算是 daemon 侧的 config.tool_default_timeout_ms:这里按同一份 config
+  // 取值,否则 CLI 的传输预算会与 daemon 的错位(CLI 先杀 → AI 拿到传输层的码)
+  const toolBudget = (requested) => {
+    if (requested !== undefined && !(Number(requested) > 0)) {
+      dieUsage(`--timeout 需要毫秒数(例: --timeout=5000),收到 ${requested}`);
+    }
+    return toolBudgetMs(requested, loadConfig().tool_default_timeout_ms);
+  };
 
   try {
     switch (command) {
       case "start": {
         // 参数已移除的显式拒绝:静默忽略会让调用方以为拿到了无头会话,而实际是有头
         if ("headless" in values) {
-          die(2, "无头启动已禁用:`--headless` 参数已移除,本工具只支持有头启动"
+          dieUsage("无头启动已禁用:`--headless` 参数已移除,本工具只支持有头启动"
             + "(无头形态未经反爬验证,无头反爬难度远高于有头)。直接运行 browser-use start 即可。");
         }
         await ensureDaemon();
@@ -220,7 +238,7 @@ usage:
       case "status": {
         await ensureDaemon();
         const alive = await new Promise((resolve) => {
-          const req = http.get({ host: "127.0.0.1", port: 17981, path: "/status", timeout: 2000 }, (res) => {
+          const req = http.get({ host: "127.0.0.1", port: daemonPort(), path: "/status", timeout: 2000 }, (res) => {
             let d = ""; res.on("data", (c) => (d += c)); res.on("end", () => resolve(d));
           });
           req.on("error", () => resolve(null));
@@ -228,12 +246,29 @@ usage:
         return jsonMode ? outJson(JSON.parse(alive ?? "{}")) : out(alive ?? "daemon 不在线");
       }
       case "config": {
-        const { default: cfg } = await import("../lib/config.mjs");
+        const { loadConfig, setConfigKey, resetConfigKey, DEFAULTS }
+          = await import("../lib/config.mjs");
         const sub = positionals[0] ?? "list";
-        if (sub === "set") cfg.setConfigKey(positionals[1], positionals[2]);
-        else if (sub === "reset") cfg.resetConfigKey(positionals[1]);
-        const c = cfg.loadConfig(true);
-        if (sub === "get") return outJson({ [positionals[1] ?? ""]: c[positionals[1] ?? ""] ?? c });
+        const keys = Object.keys(DEFAULTS).join(", ");
+        if (sub === "set") {
+          if (positionals[1] === undefined || positionals[2] === undefined) {
+            dieUsage(`config set 需要键与值: browser-use config set <键> <值>(可选键: ${keys})`);
+          }
+          setConfigKey(positionals[1], positionals[2]);
+        } else if (sub === "reset") {
+          if (positionals[1] !== undefined && !(positionals[1] in DEFAULTS)) {
+            dieUsage(`未知配置键: ${positionals[1]}(可选键: ${keys})`);
+          }
+          resetConfigKey(positionals[1]);
+        } else if (sub === "get") {
+          if (positionals[1] !== undefined && !(positionals[1] in DEFAULTS)) {
+            dieUsage(`未知配置键: ${positionals[1]}(可选键: ${keys})`);
+          }
+        } else if (sub !== "list") {
+          dieUsage(`未知 config 子命令: ${sub}(用法: browser-use config get [键] | set <键> <值> | list | reset [键])`);
+        }
+        const c = loadConfig(true);
+        if (sub === "get" && positionals[1] !== undefined) return outJson({ [positionals[1]]: c[positionals[1]] });
         return outJson(c);
       }
       case "extension": {
@@ -249,14 +284,14 @@ usage:
         const sub = positionals[0] ?? "list";
         const dryRun = !!values["dry-run"];
         const rows = AGENTS.filter((a) => !values.agent || a.key === values.agent || values.agent === "all");
-        if (values.agent && !rows.length) die(2, `未知 agent: ${values.agent}(valid: ${AGENTS.map((a) => a.key).join(", ")}, all)`);
+        if (values.agent && !rows.length) dieUsage(`未知 agent: ${values.agent}(valid: ${AGENTS.map((a) => a.key).join(", ")}, all)`);
         if (sub === "list") {
           const list = rows.map((a) => { const d = skillTargetDir(a.key, home); return { agent: a.key, label: a.label, dir: d, state: skillStatus(ROOT, d).state }; });
           if (jsonMode) return outJson({ agents: list });
           return out(list.map((r) => `${r.agent.padEnd(12)} ${r.state.padEnd(13)} ${r.dir}`).join("\n"));
         }
         if (sub === "install" || sub === "update") {
-          if (!rows.length) die(2, "install 需要 --agent=<key> 或 --all");
+          if (!rows.length) dieUsage("install 需要 --agent=<key> 或 --all");
           const results = [];
           for (const a of rows) {
             const dest = skillTargetDir(a.key, home);
@@ -275,12 +310,12 @@ usage:
           return;
         }
         if (sub === "uninstall") {
-          if (!rows.length) die(2, "uninstall 需要 --agent=<key>");
+          if (!rows.length) dieUsage("uninstall 需要 --agent=<key>");
           const results = rows.map((a) => { const dest = skillTargetDir(a.key, home); return { agent: a.key, dir: dest, removed: uninstallSkill(dest) }; });
           if (jsonMode) return outJson({ results });
           return out(results.map((r) => `${r.removed ? "removed" : "not present"} ${r.agent}: ${r.dir}`).join("\n"));
         }
-        return die(2, `用法: browser-use skill list | install --agent=<key>|--all [--force] [--dry-run] | uninstall --agent=<key>`);
+        return dieUsage(`用法: browser-use skill list | install --agent=<key>|--all [--force] [--dry-run] | uninstall --agent=<key>`);
       }
       case "allow": {
         // 放行规则写入 agent 配置文件(本地操作,不经 daemon);一 agent 多站点逐站点输出
@@ -294,7 +329,7 @@ usage:
           : !values.agent ? ["claude-code"]   // 优先平台:缺省 claude-code
           : [values.agent];
         if (values.agent && !agentAll && !ALLOW_TARGETS.some((t) => t.key === values.agent))
-          die(2, `未知 agent: ${values.agent}(valid: ${ALLOW_TARGETS.map((t) => t.key).join(", ")}, all)`);
+          dieUsage(`未知 agent: ${values.agent}(valid: ${ALLOW_TARGETS.map((t) => t.key).join(", ")}, all)`);
         const results = [];
         for (const key of requested) {
           if (dryRun) results.push(allowStatus(key, home));
@@ -330,7 +365,12 @@ usage:
         return cmdDoctor(values.fix, jsonMode);
       }
       default: {
-        // 工具命令(未知命令按工具名转发,M2/M3 未实现时 core 返回 NOT_IMPLEMENTED)
+        // 工具命令:工具名先在本层校验,未知名直接报用法错(exit 2),不转发到 core。
+        // 只在 core 侧拦会丢掉"名字写错"与"能力缺失"的区别,让 AI 误判。
+        if (!TOOL_REFERENCE[command]) {
+          const near = suggestTools(command);
+          dieUsage(`未知工具: ${command}${near.length ? `(是否想用 ${near.join(" / ")}?)` : ""}(browser-use help 列出全部工具)`);
+        }
         await ensureDaemon();
         const sid = need();
         const args = {};
@@ -343,24 +383,28 @@ usage:
           else if (v === "false") typed = false;
           args[k.replace(/-/g, "_")] = typed;   // kebab → snake(--snapshot-id → snapshot_id)
         }
+        const budgetMs = toolBudget(values.timeout);
         const r = await rpc("tool.call", { session_id: sid, tool: command, args,
-          // --timeout 双语义:rpc 层总超时 + 工具级参数(navigate_page/wait_for 等,毫秒)。
-          // rpc 侧加 5s 余量:工具级超时须先于传输层杀死调用,才能带回自己的错误语义
-          timeout_ms: values.timeout ? Number(values.timeout) + 5000 : undefined });
+          // --timeout 双语义:工具级参数(navigate_page/wait_for 等,毫秒)+ 传输预算基准。
+          // 预算阶梯见 lib/budget.mjs:传输预算必须晚于工具预算到点,工具才有机会带回自己的错误语义
+          timeout_ms: values.timeout === undefined ? undefined : budgetMs },
+          cliRpcTimeoutMs(budgetMs));
         if (jsonMode) return outJson(r);
         return out(fmtResult(command, r));
       }
     }
   } catch (e) {
+    // 退出码与错误码同表(lib/error-codes.mjs):同一个码在 CLI 层与 core 层发现,退出码必须一致
+    const code = e.code ?? "INTERNAL";
     if (jsonMode) {
-      outJson({ error: { code: e.code ?? "INTERNAL", message: e.message, retryable: !!e.retryable } });
+      outJson({ error: { code, message: e.message, retryable: !!e.retryable } });
     } else {
-      errOut(`error[${e.code ?? "INTERNAL"}]: ${e.message}\n`);
-      if (e.code === "BRIDGE_NOT_CONNECTED" || e.code === "BRIDGE_TIMEOUT") {
+      errOut(`error[${code}]: ${e.message}\n`);
+      if (code === "BRIDGE_NOT_CONNECTED" || code === "BRIDGE_TIMEOUT") {
         errOut("提示: 请确认日常浏览器已打开、Bridge 扩展 popup 显示已连接;或 browser-use session.bare --session=<id> 跳过登录态。\n");
       }
     }
-    process.exit(e.code === "BRIDGE_NOT_CONNECTED" || e.code === "BRIDGE_TIMEOUT" ? 4 : 5);
+    process.exit(exitCodeFor(code));
   }
 }
 
@@ -418,4 +462,4 @@ async function cmdDoctor(fix, jsonMode) {
   process.exitCode = allOk ? 0 : 3;
 }
 
-main().catch((e) => die(5, e.message));
+main().catch((e) => { errOut(`error[INTERNAL]: ${e.message}\n`); process.exit(ERROR_CODES.INTERNAL.exit); });

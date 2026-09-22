@@ -12,6 +12,8 @@ import json
 import os
 import time
 
+from .errors import NotFoundError, PageError, TimeoutExceeded, UnsupportedError, UsageError
+
 # ---- 浏览器级 CDP 通道(经 daemon /pipe/cdp 转发;Extensions 走 ws、PWA 走 pipe) ----
 
 def _pipe_call(sess, method, timeout=30, **params):
@@ -104,7 +106,7 @@ def screencast_stop(sess, args, session_dir):
     except Exception:
         pass
     if sess._cast_frames == 0:
-        raise RuntimeError("screencast 未捕获到任何帧(渲染管线无活动)")
+        raise PageError("screencast 未捕获到任何帧(渲染管线无活动)")
     return {"stopped": True, "frames": sess._cast_frames, "frames_dir": sess._cast_dir}
 
 
@@ -226,7 +228,7 @@ def _3p_discover(sess):
                   returnByValue=True, awaitPromise=True)
     detail = r.get("exceptionDetails")
     if detail:
-        raise RuntimeError(f"3p 工具发现失败: {detail.get('text')}")
+        raise PageError(f"3p 工具发现失败: {detail.get('text')}")
     return r.get("result", {}).get("value") or []
 
 
@@ -250,20 +252,21 @@ def execute_3p_developer_tool(sess, args, session_dir):
         try:
             params = json.loads(params)
         except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse params as JSON: {e}") from None
+            raise UsageError(f"Failed to parse params as JSON: {e}") from None
     if params is None or params == "":
         params = {}
     if not isinstance(params, dict):
-        raise ValueError("Parsed params is not an object")
+        raise UsageError("Parsed params is not an object")
     if any(isinstance(v, dict) and set(v.keys()) == {"uid"} for v in params.values()):
-        raise NotImplementedError("params 中的 {uid} 元素引用暂不支持(已知降级,见审查报告)")
+        raise UnsupportedError("params 中的 {uid: ...} 元素引用不支持:本实现不做 uid 解引用,"
+                                 "请先用 evaluate_script 取到目标值,再以字面量传入 params")
     _3p_discover(sess)  # 执行前刷新发现(cdt:getToolGroups → 找 tool)
     expr = _3P_EXECUTE_TMPL.format(name=json.dumps(tool_name), args=json.dumps(params))
     r = sess.t.run_cdp("Runtime.evaluate", expression=expr, returnByValue=True, awaitPromise=True)
     detail = r.get("exceptionDetails")
     if detail:
         text = (detail.get("exception", {}) or {}).get("description") or detail.get("text", "execute failed")
-        raise RuntimeError(f"3p 工具执行失败: {text.strip()}")
+        raise PageError(f"3p 工具执行失败: {text.strip()}")
     out = json.loads(r.get("result", {}).get("value") or "{}")
     return {"result": out.get("result"), "stashed": out.get("stashed", 0)}
 
@@ -279,7 +282,7 @@ def _webmcp_cdp(sess):
 
 def list_webmcp_tools(sess, args, session_dir):
     if not getattr(sess, "webmcp_enabled", False):
-        raise RuntimeError(
+        raise UnsupportedError(
             "WebMCP 需要 --enable-features=WebMCP 启动 flag(Edge 150+ 默认关闭)。"
             "该 flag 属运行时特征变更,默认不启用(CONSTRAINT-001 权衡);"
             "如需使用:browser-use start --extra-flags '[\"--enable-features=WebMCP\"]' 以带 flag 会话运行。")
@@ -311,14 +314,14 @@ def execute_webmcp_tool(sess, args, session_dir):
         tools = getattr(sess, "_webmcp_tools", {})
     t = tools.get(name)
     if not t:
-        raise ValueError(f"Tool {name} not found")  # 文案对齐 cdt webmcp.ts
+        raise NotFoundError(f"Tool {name} not found")  # 文案对齐 cdt webmcp.ts
     inp = args.get("input")
     try:
         input_obj = json.loads(inp) if isinstance(inp, str) else (inp or {})
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse input as JSON: {e}") from None
+        raise UsageError(f"Failed to parse input as JSON: {e}") from None
     if not isinstance(input_obj, dict):
-        raise ValueError("Parsed input is not an object")  # 文案对齐 cdt
+        raise UsageError("Parsed input is not an object")  # 文案对齐 cdt
     cdp = _webmcp_cdp(sess)
     r = cdp.call("WebMCP.invokeTool", frameId=t.get("frameId"), toolName=name, input=input_obj)
     inv = r.get("invocationId")
@@ -334,7 +337,7 @@ def execute_webmcp_tool(sess, args, session_dir):
         cdp.call("WebMCP.cancelInvocation", invocationId=inv)
     except Exception:
         pass
-    raise TimeoutError(f"WebMCP 工具 {name} 响应超时")
+    raise TimeoutExceeded(f"WebMCP 工具 {name} 响应超时")
 
 
 # ---- PWA 四件套(pipe 通道;ws 上 PWA 域不可达已实证) ----
@@ -408,10 +411,10 @@ def reload_extension(sess, args, session_dir):
     exts = _pipe_call(sess, "Extensions.getExtensions").get("extensions", [])
     ext = next((e for e in exts if e.get("id") == eid), None)
     if not ext:
-        raise KeyError(f"Extension with ID {eid} not found.")  # 文案对齐 cdt
+        raise NotFoundError(f"Extension with ID {eid} not found.")  # 文案对齐 cdt
     path = ext.get("path")
     if not path:
-        raise ValueError(f"Extension with ID {eid} has no local path (not unpacked; cannot reload).")
+        raise UsageError(f"Extension with ID {eid} has no local path (not unpacked; cannot reload).")
     _pipe_call(sess, "Extensions.loadUnpacked", path=path, timeout=60)
     time.sleep(0.8)  # 旧 service worker 摘除/新 SW 注册的窗口期
     r = _pipe_call(sess, "Target.getTargets")
@@ -439,13 +442,13 @@ def lighthouse_audit(sess, args, session_dir):
     mode = args.get("mode") or "navigation"
     device = args.get("device") or "desktop"
     if mode != "navigation":
-        raise ValueError("mode=snapshot 需要 lighthouse 编程式 API,CLI attach 模式仅支持 navigation")
+        raise UnsupportedError("mode=snapshot 需要 lighthouse 编程式 API,CLI attach 模式仅支持 navigation")
     if device not in ("desktop", "mobile"):
-        raise ValueError(f"device 必须是 desktop/mobile,收到 {device}")
+        raise UsageError(f"device 必须是 desktop/mobile,收到 {device}")
     port = sess.port
     url = sess.t.run_js("return location.href")
     if not url or url.startswith(("edge://", "chrome://", "about:", "file://")):
-        raise ValueError("lighthouse 需要一个 http(s) 页面(先 navigate)")
+        raise UsageError("lighthouse 需要一个 http(s) 页面(先 navigate)")
     only = args.get("onlyCategories") or "accessibility,seo,best-practices,agentic-browsing"
     out_dir = args.get("outputDirPath") or sess.artifact_path(session_dir, "lighthouse", "dir")
     os.makedirs(out_dir, exist_ok=True)
@@ -469,7 +472,7 @@ def lighthouse_audit(sess, args, session_dir):
                           shell=(os.name == "nt"))
     json_path = f"{out_prefix}.report.json"
     if proc.returncode != 0 or not os.path.exists(json_path):
-        raise RuntimeError(f"lighthouse 执行失败: {(proc.stderr or proc.stdout)[-300:]}")
+        raise PageError(f"lighthouse 执行失败: {(proc.stderr or proc.stdout)[-300:]}")
     with open(json_path, encoding="utf-8") as f:
         report = json.load(f)
     scores = [{"id": c.get("id"), "title": c.get("title"), "score": c.get("score")}

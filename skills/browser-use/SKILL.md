@@ -48,6 +48,7 @@ browser-use stop --session=<id>
 - **Snapshot scrolling hints**: the snapshot annotates each scrollable container (`scroll=... ↓2.3p` = pages below viewport) and counts off-screen interactive elements (`hint:` lines). Scroll to reveal, then re-snapshot.
 - **Incremental capture**: `list_console_messages` and `list_network_requests` return the messages/requests captured **since the previous call** (incremental), each with a stable `msgid`/`reqid`; fetch details with `get_console_message` / `get_network_request`. Call the list tool after the action you care about, not once at the end of a long session, if you need per-step capture.
 - **Downloads**: downloaded files land in the session's `downloads/` directory (they are deleted by `stop` — move files you need out before stopping). To grab a download URL: navigating to the direct link (or clicking a download button) triggers the download; the request shows up in `list_network_requests` when entered via a **direct-link navigation** (its body is `null` — the download stream is not a page response). Requests fired by a **click on a download button** bypass the page's Network events entirely (browser-level download channel) — verify success by the file appearing on disk, not by the request list.
+- **Browser-internal pages**: the browser sometimes opens its own UI pages (`edge://…`, e.g. the downloads hub after a download). They appear in `list_pages`, but they never become the current page on their own — tool calls keep working on your task page, and a one-time `notice: Browser-internal page opened …` line says what opened. Ignoring them is fine.
 
 ## Command usage
 
@@ -83,13 +84,33 @@ The **Tool reference** section at the end of this file maps every tool to its pa
 
 ## Errors and retry
 
-- **Exit codes**: 0 success; 2 usage error (missing `--session`, unknown tool); 3 environment error (`doctor`); 4 bridge/precondition unreachable; 5 tool execution failure. Errors also print an `error[CODE]: message` line on stderr; with `--output-format=json` the error arrives as JSON on stdout.
+Every failure prints `error[CODE]: message` on stderr; with `--output-format=json` it arrives as `{error:{code,message,retryable}}` on stdout. The code names the true cause, the message carries the next action.
+
+| Code | Meaning | What to do | Retry | Exit |
+| --- | --- | --- | --- | --- |
+| `INVALID_ARG` | The call itself is wrong: bad value, unknown flag, malformed JSON, unknown tool name. | Fix the call; `browser-use help <tool>` gives the exact signature. | no | 2 |
+| `NOT_FOUND` | The referenced local artifact or object does not exist (snapshot file, extension id, page). | Create or list it first, then retry with a valid reference. | no | 2 |
+| `UNSUPPORTED` | This build or this browser deliberately does not perform that operation. | Use the alternative the message names. | no | 2 |
+| `PAGE_BLOCKED` | A modal dialog blocks the page. | Run `handle_dialog` first, then repeat the call. | no | 2 |
+| `STATE_EXPIRED` | The referenced state is gone: uid, msgid, reqid, snapshot, or the selected page. The page re-rendered, so the browser dropped the old reference (the raw protocol error in the message says so). | Re-run `take_snapshot` / `list_network_requests` / `select_page`, then act on the fresh ids. | yes, after refreshing | 5 |
+| `PAGE_ERROR` | A page-side script or tool threw; the page's error text is in the message. | Read the message: fix the call or choose another target. | no | 5 |
+| `TIMEOUT` | The call's own budget ran out. | Raise `--timeout` or wait on a more specific condition. | yes | 5 |
+| `CORE_TIMEOUT` | The core did not answer within its budget. The tool's own budget already carries transport slack, so this means the core stalled (usually inside a browser call). | Retry once; if it repeats, raise `--timeout` and tell the user. | yes | 5 |
+| `INTERNAL` | An internal condition failed, or the cause is unattributed. | Follow the message; do not repeat as-is; report to the user with the session log if it persists. | no | 5 |
+| `CDP_ERROR` | A browser-protocol call failed. | Check the session is alive (`select_page`, or a new session). | no | 4 |
+| `BROWSER_NOT_RUNNING` | The session's browser, or its debug port, is unreachable. | Check the browser is still up; `new_page` or a new session. | no | 4 |
+| `PIPE_UNAVAILABLE` | The pipe channel is not available for this session. | Use a channel the domain allows, or restart the session in pipe form. | no | 4 |
+| `PORT_EXHAUSTED` | The debug-port range is used up. | `sessions clean`, then retry. | no | 4 |
+| `SESSION_NOT_FOUND` | No such session, or it is not ready. | `start` a session, or check `sessions list`. | no | 4 |
+| `CORE_DEAD` | The session's core process exited. | Start a new session; check `~/.browser-use/daemon.log` if it repeats. | no | 4 |
+| `BRIDGE_NOT_CONNECTED` | The login-state bridge is down: daily browser closed, or extension disconnected. | Ask the user to open the daily browser and confirm the extension popup shows connected; or run `session.bare`. | no | 4 |
+| `BRIDGE_TIMEOUT` | The bridge did not answer in time. | Confirm the daily browser and extension are online, then retry. | yes | 4 |
+
+Exit codes: `0` success, `2` the call can be fixed, `4` environment unreachable or an outside action is needed, `5` execution failed. `3` is reserved for environment self-checks (`doctor`) and daemon startup; those messages carry no code.
+
 - **Argument errors, unknown flags, wrong arg order**: do not guess. Run `browser-use help <tool>` for that tool's exact signature, fix the command, retry.
-- **uid stale** (`click`/`fill` misses after navigation or SPA re-render): re-run `take_snapshot`, act on fresh uids.
-- **`BRIDGE_NOT_CONNECTED` / `BRIDGE_TIMEOUT`** (at start, or a tool needs login state): the daily browser may be closed or the bridge extension disconnected. Ask the user to open the daily browser and check the extension popup shows connected, then retry; or run `browser-use session.bare --session=<id>` when the task needs no login.
-- **`No open dialog found`** from `handle_dialog`: nothing is blocking; dialogs block page scripts until handled, so handle them promptly when a page freezes.
-- **`Request not found for selected page`**: the `msgid`/`reqid` is unknown or from before this session; list again and use a fresh id.
-- **`NOT_IMPLEMENTED`**: the tool exists in the surface but this install lacks its runtime (for example lighthouse needs the Lighthouse CLI via npx). Do not retry.
+- **Unknown tool name** (exit 2, `error[INVALID_ARG]: 未知工具: <name>`): the name is not one of the documented tools. A misspelling is caught locally before the call reaches the core, and the closest documented names are printed after it. Run `browser-use help` for the full list; do not retry the same spelling.
+- **`No open dialog found`** from `handle_dialog` (arrives as `INVALID_ARG`): nothing is blocking; dialogs block page scripts until handled, so handle them promptly when a page freezes.
 - `browser-use doctor [--fix]` checks node, python, the DrissionPage core, and Edge, and auto-installs what it can.
 
 ## Red lines
@@ -163,7 +184,7 @@ Every tool command requires `--session=<id>` (the id printed by `start`). The si
 | `close_page` | Closes a page. | `<page_id>` | The last open page cannot be closed. |
 | `list_pages` | Lists open pages. | | |
 | `navigate_page` | Navigates: URL, back, forward, reload. | `[url]` `--type` `--ignoreCache` `--timeout` `--initScript` `--handleBeforeUnload` | `url` applies only to `--type url` (the default). Default URL budget is 20 s (`--timeout` overrides); slow pages return an "Unable to navigate" message rather than hanging. |
-| `new_page` | Opens a new tab. | `<url>` `--background` `--isolatedContext` `--timeout` | Returns the new page id. |
+| `new_page` | Opens a new tab. | `<url>` `--background` `--isolatedContext` `--timeout` | Returns the new page id. `--isolatedContext` also works in a port-only session (that request goes over the browser-level channel). |
 | `select_page` | Selects the page, brings it to the browser foreground, and routes future tool calls there; a later active-tab change takes precedence. | `<page_id>` `--bringToFront` | |
 | `wait_for` | Waits for text to appear. | `<text>` `--timeout` | Searches the main document and all frames. |
 
@@ -238,6 +259,8 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 | `list_webmcp_tools` | Lists page-exposed WebMCP tools. | | Same session requirement. |
 
 ### PWA (4 tools)
+
+These four tools are the only ones that need the debugging pipe. In a port-only session they report `PIPE_UNAVAILABLE` (exit 4); everything else keeps working — the Extensions tools, `new_page --isolatedContext`, and every page tool.
 
 | Tool | Description | Signature | Notes |
 |---|---|---|---|

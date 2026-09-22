@@ -13,6 +13,8 @@ import json
 import os
 import time
 
+from .errors import UsageError
+
 # DevTools Tracing 默认类别(cdt: '-*' + TracingDefaultCategories + JsSampling + Screenshot)
 _TRACE_CATEGORIES = [
     "-*",
@@ -48,7 +50,7 @@ def _start_tracing(cdp):
 def performance_start_trace(sess, args, session_dir):
     from .tools import _live_url  # 局部导入:tools.py 底部反向挂载本模块,顶层导入会循环
     if getattr(sess, "_tracing_on", False):
-        raise RuntimeError("a performance trace is already running. Use performance_stop_trace "
+        raise UsageError("a performance trace is already running. Use performance_stop_trace "
                            "to stop it. Only one trace can be running at any given time.")
     sess._tracing_on = True
     cdp = _ensure_cdp(sess)
@@ -123,7 +125,7 @@ def performance_analyze_insight(sess, args, session_dir):
     (接受但影响返回的自选 insight 子集);filePath 为本实现的 trace 来源。"""
     fp = args.get("filePath")
     if not fp or not os.path.exists(fp):
-        raise ValueError("需要 performance_stop_trace 产出的 filePath")
+        raise UsageError("需要 performance_stop_trace 产出的 filePath")
     with open(fp, encoding="utf-8") as f:
         trace = json.load(f)
     ev = trace.get("traceEvents", [])

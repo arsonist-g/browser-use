@@ -13,10 +13,71 @@ import urllib.request
 
 import websocket
 
+from .errors import BrowserUnavailable, CdpError, CoreCallTimeout, PipeUnavailable, StateExpiredError
+
+# 引用失效类 CDP 报错的特征:uid(元素引用)、执行上下文、对象句柄在页面重渲染/重建后
+# 都会被浏览器作废,而调用方手里的引用看起来仍然有效(uid_map 里还在)。这类错误对 AI
+# 是"手里的引用过期了",必须报 STATE_EXPIRED(刷新状态后可重试);报成 CDP_ERROR
+# (不可重试)会让 AI 以为协议/会话坏了而放弃任务。其余 CDP 错误仍归 CDP_ERROR。
+_STALE_REFERENCE_MARKERS = (
+    "no node found for given backend id",
+    "could not find node with given id",
+    "invalid node id",
+    "node is detached from document",
+    "does not belong to the document",
+    "could not find object with given id",
+    "cannot find context with specified id",
+    "execution context was destroyed",
+)
+
+
+def _cdp_error_text(detail):
+    """CDP 错误正文:取 message(而非整个 error 对象),AI 读到的才是原因本身。"""
+    if isinstance(detail, dict):
+        msg = detail.get("message")
+        return msg.strip() if isinstance(msg, str) and msg.strip() else json.dumps(detail, ensure_ascii=False)
+    text = str(detail)
+    # pipe 通道把 error 对象当字符串回传(JSON 文本):能解出 message 就用 message
+    if text.strip().startswith("{"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("message"), str) and obj["message"].strip():
+            return obj["message"].strip()
+    return text
+
+
+def cdp_failure(method, detail, label="CDP"):
+    """CDP 错误 → 失败分类(码即真原因)。detail 为 error 对象或其 JSON 文本。"""
+    text = _cdp_error_text(detail)
+    low = text.lower()
+    if any(m in low for m in _STALE_REFERENCE_MARKERS):
+        return StateExpiredError(
+            f"{method} 引用的页面状态已失效({text});请重新 take_snapshot / list 后用新 id 重试")
+    return CdpError(f"{label} {method}: {text}")
+
+
+# daemon 侧已经给出的失败码(码表见 lib/error-codes.mjs):它们比"协议层失败"更具体,
+# 折叠成 CDP_ERROR 会让 AI 以为会话坏了而放弃(port-only 会话调 PWA 工具即此类)。
+_DAEMON_CODE_FAILURES = {
+    "PIPE_UNAVAILABLE": PipeUnavailable,
+    "BROWSER_NOT_RUNNING": BrowserUnavailable,
+    "CORE_TIMEOUT": CoreCallTimeout,
+}
+
+
+def _daemon_failure(method, err):
+    """daemon /pipe/cdp 的失败体 → 失败分类:它给的码优先,码表外的仍按协议错误归类。"""
+    message = err.get("message", err)
+    text = message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
+    cls = _DAEMON_CODE_FAILURES.get(err.get("code"))
+    return cls(text) if cls is not None else cdp_failure(method, text, label="pipe CDP")
+
 
 def pipe_call(session_id, method, timeout=30, **params):
-    """经 daemon 的 /pipe/cdp 端点调浏览器级(pipe 通道)CDP。
-    Target.createBrowserContext 等 browser 端点命令只有这条通道可达。"""
+    """经 daemon 的 /pipe/cdp 端点调浏览器级 CDP(daemon 按域名选浏览器级 ws 或 pipe)。
+    调用方不关心通道:Target/Extensions 走 ws(port-only 会话同样成立),PWA 走 pipe。"""
     daemon_port = os.environ.get("BU_DAEMON_PORT", "17981")
     params = {k: v for k, v in params.items() if v is not None}  # null 参数会被 CDP 拒收
     body = json.dumps({"session_id": session_id, "method": method,
@@ -31,9 +92,9 @@ def pipe_call(session_id, method, timeout=30, **params):
             err = json.loads(e.read()).get("error", {})
         except Exception:
             err = {"message": f"HTTP {e.code}"}
-        raise RuntimeError(f"pipe CDP {method}: {err.get('message', err)}") from None
+        raise _daemon_failure(method, err) from None
     if not resp.get("ok"):
-        raise RuntimeError(f"pipe CDP {method}: {resp.get('error', {}).get('message', resp)}")
+        raise _daemon_failure(method, resp.get("error") or {})
     return resp.get("result", {})
 
 
@@ -101,7 +162,7 @@ class BrowserNetworkRecorder:
                 f"http://127.0.0.1:{self.port}/json/version", timeout=5).read())
             ws_url = version.get("webSocketDebuggerUrl")
             if not ws_url:
-                raise RuntimeError("browser websocket unavailable")
+                raise BrowserUnavailable("browser websocket unavailable")
             self.ws = websocket.create_connection(
                 ws_url, timeout=0.25, suppress_origin=True)
             self._send("Target.setAutoAttach", autoAttach=True,
@@ -231,7 +292,7 @@ class CdpEvents:
         pick = next((t for t in pages if t.get("id") == target_id), None) \
             or (pages[0] if pages else None)
         if not pick:
-            raise RuntimeError("no page target on debug port")
+            raise BrowserUnavailable("no page target on debug port(先 new_page 或新建会话)")
         self.target_id = pick.get("id")
         self.ws = websocket.create_connection(pick["webSocketDebuggerUrl"],
                                               timeout=self.recv_granularity, suppress_origin=True)
@@ -277,7 +338,7 @@ class CdpEvents:
             self.pump()
         r = self.responses.pop(mid)
         if "error" in r:
-            raise RuntimeError(f"CDP {method}: {r['error']}")
+            raise cdp_failure(method, r["error"])
         return r.get("result", {})
 
     def pump(self, deadline=None):

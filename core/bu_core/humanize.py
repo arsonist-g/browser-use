@@ -15,6 +15,8 @@ import math
 import random
 import time
 
+from .errors import UsageError
+
 # ---- MouseTrajectories.hpp 常量(逐项对应,勿改值——改值即偏离基线) ----
 _KNOT_MARGIN = 80      # generateCurve:控制点采样区 = 起终点包围盒外扩 px
 _KNOT_COUNT = 2        # generateCurve:内部控制点数(4 点 = 三次贝塞尔)
@@ -200,12 +202,12 @@ def parse_key(key_input):
     if buf:
         result.append(buf)
     if not result:
-        raise ValueError(f"Key {key_input} could not be parsed.")
+        raise UsageError(f"Key {key_input} could not be parsed.")
     if len(set(result)) != len(result):
-        raise ValueError(f"Key {key_input} contains duplicate keys.")
+        raise UsageError(f"Key {key_input} contains duplicate keys.")
     invalid = [k for k in result if _vk(k) == 0]
     if invalid:
-        raise ValueError(f"Key {key_input} is invalid: {invalid[0]}")
+        raise UsageError(f"Key {key_input} is invalid: {invalid[0]}")
     # cdt 形状:[主键, ...修饰键](主键在末位 → 返回时反转)
     return [result[-1], *result[:-1]]
 

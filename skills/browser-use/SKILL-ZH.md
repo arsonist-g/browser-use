@@ -49,6 +49,7 @@ browser-use stop --session=<id>
 - **先检查,再操作,再复查。** 元素 uid 来自 `take_snapshot`;uid 在页面导航或 SPA DOM 重建后失效,所以 `click`/`fill` 报错时,重新 `take_snapshot` 并使用新 uid。
 - **快照滚动标注**:快照为每个可滚动容器标注(`scroll=... ↓2.3p` 表示视口下方还有 2.3 页)并统计视口外可交互元素(`hint:` 行)。先滚动呈现,再重新快照。
 - **增量捕获**:`list_console_messages` 和 `list_network_requests` 返回自上次调用以来**新捕获**的消息/请求,各带稳定的 `msgid`/`reqid`;用 `get_console_message` / `get_network_request` 取详情。需要按步骤捕获时,在关键动作之后调用 list 工具,而不要拖到长会话的最后一次性调用。
+- **浏览器内建页**:浏览器有时会自己打开 UI 页(`edge://…`,例如下载后的下载中心)。它们会出现在 `list_pages` 里,但不会自动成为当前页 —— 工具调用仍在你的任务页上工作,并有一行一次性 `notice: Browser-internal page opened …` 说明浏览器打开了什么。忽略即可。
 
 ## Command usage
 
@@ -84,13 +85,33 @@ browser-use <tool> --session=<id> [必需位置参数] [--可选flags]
 
 ## Errors and retry
 
-- **退出码**:0 成功;2 用法错(缺 `--session`、未知工具);3 环境错(`doctor`);4 桥/前提不可达;5 工具执行失败。错误同时在 stderr 打 `error[CODE]: message` 行;`--output-format=json` 时错误以 JSON 走 stdout。
+每条失败都在 stderr 打 `error[CODE]: message`;`--output-format=json` 时以 `{error:{code,message,retryable}}` 走 stdout。码指向真原因,正文给出下一步动作。
+
+| 码 | 含义 | 下一步 | 可重试 | 退出码 |
+| --- | --- | --- | --- | --- |
+| `INVALID_ARG` | 调用本身写错:取值不合法、未知 flag、JSON 解析失败、工具名不存在 | 改正调用;`browser-use help <tool>` 给准确签名 | 否 | 2 |
+| `NOT_FOUND` | 引用的本地产物/对象不存在(快照文件、扩展 id、页面) | 先创建或列举,再用有效引用重试 | 否 | 2 |
+| `UNSUPPORTED` | 本 build 或该浏览器有意不做该操作 | 改用正文给出的替代方式 | 否 | 2 |
+| `PAGE_BLOCKED` | 模态弹窗阻塞页面 | 先 `handle_dialog`,再重试原调用 | 否 | 2 |
+| `STATE_EXPIRED` | 引用的状态已过期:uid、msgid、reqid、快照、选中页(页面重渲染后浏览器作废旧引用,正文里的协议原文即该引用已失效) | 重新 `take_snapshot` / `list_network_requests` / `select_page`,用新 id 操作 | 是(先刷新) | 5 |
+| `PAGE_ERROR` | 页面侧脚本或工具抛错(页面报错原文附在正文) | 读正文:改调用或换目标 | 否 | 5 |
+| `TIMEOUT` | 本次调用自身预算用尽 | 加大 `--timeout`,或等更明确的条件 | 是 | 5 |
+| `CORE_TIMEOUT` | core 未在预算内返回(工具自身预算已含传输余量,说明 core 卡住了) | 重试一次;仍出现则说明 core 卡在浏览器调用上,加大 `--timeout` 并告知用户 | 是 | 5 |
+| `INTERNAL` | 内部条件不满足或未归因 | 按正文处理;不要原样重试,反复出现则报告用户并附会话日志 | 否 | 5 |
+| `CDP_ERROR` | 浏览器调试协议层调用失败 | 确认会话仍存活(`select_page` 或新会话) | 否 | 4 |
+| `BROWSER_NOT_RUNNING` | 会话浏览器或其调试端口不可达 | 确认浏览器仍在;`new_page` 或新建会话 | 否 | 4 |
+| `PIPE_UNAVAILABLE` | 该会话的 pipe 通道不可用 | 改用该域允许的通道,或用 pipe 形态重开会话 | 否 | 4 |
+| `PORT_EXHAUSTED` | 调试端口段用尽 | `sessions clean` 后重试 | 否 | 4 |
+| `SESSION_NOT_FOUND` | 会话不存在或未就绪 | `start` 新会话,或 `sessions list` 核对 | 否 | 4 |
+| `CORE_DEAD` | 会话 core 进程已退出 | 新建会话;反复出现查 `~/.browser-use/daemon.log` | 否 | 4 |
+| `BRIDGE_NOT_CONNECTED` | 登录态桥未连接(日常浏览器未开或扩展未连) | 请用户打开日常浏览器并确认扩展 popup 已连接;或 `session.bare` | 否 | 4 |
+| `BRIDGE_TIMEOUT` | 桥未及时应答 | 确认日常浏览器与扩展在线后重试 | 是 | 4 |
+
+退出码:`0` 成功;`2` 调用可修;`4` 环境不可达或需外部动作;`5` 执行失败。`3` 保留给环境自检(`doctor`)与 daemon 启动类,这类正文不带码。
+
 - **参数错误、未知 flags、参数顺序不对**:不要猜。运行 `browser-use help <tool>` 核对该工具的准确签名,修正命令后重试。
-- **uid 失效**(导航或 SPA 重渲染后 `click`/`fill` 落空):重新 `take_snapshot`,用新 uid 操作。
-- **`BRIDGE_NOT_CONNECTED` / `BRIDGE_TIMEOUT`**(start 时,或工具需要登录态):日常浏览器可能未开或桥扩展未连接。请用户打开日常浏览器并确认扩展 popup 显示已连接,然后重试;或任务不需要登录时运行 `browser-use session.bare --session=<id>`。
-- **`No open dialog found`**(`handle_dialog` 返回):当前没有弹窗;弹窗会阻塞页面脚本直至被处理,页面卡住时及时处理。
-- **`Request not found for selected page`**:`msgid`/`reqid` 不存在或属于会话更早阶段;重新 list 并使用新 id。
-- **`NOT_IMPLEMENTED`**:工具在面上存在但本机安装缺运行时(如 lighthouse 需要 npx 拉取 Lighthouse CLI)。不要重试。
+- **工具名不存在**(退出码 2,`error[INVALID_ARG]: 未知工具: <name>`):名字不在文档化的工具清单里。拼写错误在本地就被拦下(不会转发到 core),并随后列出最接近的工具名。`browser-use help` 列出全部工具名;不要用同一个拼法重试。
+- **`No open dialog found`**(`handle_dialog` 返回,码为 `INVALID_ARG`):当前没有弹窗;弹窗会阻塞页面脚本直至被处理,页面卡住时及时处理。
 - `browser-use doctor [--fix]` 检查 node、python、DrissionPage 内核与 Edge,能自动装的就地补齐。
 
 ## Red lines
@@ -164,7 +185,7 @@ Every tool command requires `--session=<id>` (the id printed by `start`). Requir
 | `close_page` | Closes a page. | `page_id*` | The last open page cannot be closed. |
 | `list_pages` | Lists open pages. | | |
 | `navigate_page` | Navigates: URL, back, forward, reload. | `url` `--type` `--ignoreCache` `--timeout` `--initScript` `--handleBeforeUnload` | `url` applies only to `--type url` (the default). |
-| `new_page` | Opens a new tab. | `url*` `--background` `--isolatedContext` `--timeout` | Returns the new page id. |
+| `new_page` | Opens a new tab. | `url*` `--background` `--isolatedContext` `--timeout` | Returns the new page id. `--isolatedContext` 在 port-only 会话下同样可用(该请求走浏览器级通道)。 |
 | `select_page` | Selects the page, brings it to the browser foreground, and routes future tool calls there; a later active-tab change takes precedence. | `page_id*` `--bringToFront` | |
 | `wait_for` | Waits for text to appear. | `text*` `--timeout` | Searches the main document and all frames. |
 
@@ -239,6 +260,8 @@ All memory tools address snapshots by their `.heapsnapshot` file path.
 | `list_webmcp_tools` | Lists page-exposed WebMCP tools. | | Same session requirement. |
 
 ### PWA (4 tools)
+
+只有这四个工具需要调试 pipe。port-only 会话下它们报 `PIPE_UNAVAILABLE`(退出码 4),其余一切照常:Extensions 工具、`new_page --isolatedContext` 与所有页面级工具都可用。
 
 | Tool | Description | Parameters | Notes |
 |---|---|---|---|

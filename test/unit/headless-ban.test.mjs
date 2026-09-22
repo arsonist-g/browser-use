@@ -109,5 +109,6 @@ test("config: DEFAULTS 不再暴露 headless_default", () => {
 });
 
 test("config: setConfigKey 拒绝 headless_default", () => {
-  assert.throws(() => setConfigKey("headless_default", "true"), /unknown config key/);
+  // 契约:未知键是调用方写错参数(INVALID_ARG),正文必须列出可选键
+  assert.throws(() => setConfigKey("headless_default", "true"), /未知配置键: headless_default/);
 });

@@ -1,5 +1,5 @@
 // 单元测试:命令放行逻辑(目标表完整性 / 三形态站点 / 幂等合并 / 破损配置保护 / 移除语义)
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -9,9 +9,19 @@ import { ALLOW_TARGETS, findTarget, allowStatus, addAllow, removeAllow }
 
 const BIN = "browser-use";
 
+// 临时 home 一律登记后统一删除:漏删会让 %TEMP% 每跑一次测试多一批目录(实测残留 130+ 个)
+const TMP_HOMES = [];
 function tmpHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "bu-allow-test-"));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "bu-allow-test-"));
+  TMP_HOMES.push(d);
+  return d;
 }
+
+after(() => {
+  for (const d of TMP_HOMES) {
+    if (d.startsWith(os.tmpdir())) fs.rmSync(d, { recursive: true, force: true, maxRetries: 5 });
+  }
+});
 
 // 临时改环境变量并在结束后恢复(CLAUDE_CONFIG_DIR / APPDATA / XDG_CONFIG_HOME / OPENCODE_CONFIG)
 function withEnv(vars, fn) {

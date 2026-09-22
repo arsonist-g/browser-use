@@ -13,6 +13,8 @@ import re
 import time
 from collections import defaultdict, deque
 
+from .errors import NotFoundError, UnsupportedError, UsageError
+
 
 class HeapSnapshot:
     """懒解析的堆快照:nodes/edges 展平数组 → 结构化记录。"""
@@ -194,7 +196,7 @@ def _load(path):
     path = os.path.abspath(str(path))
     if path not in _registry:
         if not os.path.exists(path):
-            raise ValueError(f"heapsnapshot 文件不存在: {path}(先 take_heapsnapshot)")
+            raise NotFoundError(f"heapsnapshot 文件不存在: {path}(先 take_heapsnapshot)")
         _registry[path] = HeapSnapshot(path)
     return _registry[path]
 
@@ -288,7 +290,7 @@ def close_heapsnapshot(sess, args, session_dir):
     if fp in _registry:
         del _registry[fp]
         return {"closed": fp}
-    raise ValueError(f"Failed to close heap snapshot: {fp} was not loaded.")
+    raise NotFoundError(f"Failed to close heap snapshot: {fp} was not loaded.")
 
 
 def get_heapsnapshot_summary(sess, args, session_dir):
@@ -315,7 +317,7 @@ def get_heapsnapshot_details(sess, args, session_dir):
     hs = _load(args.get("filePath"))
     agg = _class_aggregates(hs)
     if args.get("filterName"):
-        raise ValueError("filterName (retention attribution) is not supported; "
+        raise UnsupportedError("filterName (retention attribution) is not supported; "
                          "omit it to list class aggregates")
     total = len(agg)
     agg = _page(agg, args)
@@ -331,7 +333,7 @@ def get_heapsnapshot_class_nodes(sess, args, session_dir):
     cid = int(args["id"])
     hit = next((a for a in agg if a["id"] == cid), None)
     if hit is None:
-        raise ValueError(f"class id {cid} not found (see get_heapsnapshot_details)")
+        raise NotFoundError(f"class id {cid} not found (see get_heapsnapshot_details)")
     rows = [_node_row(hs, n, retained) for n in hs.nodes if n["name"] == hit["name"]]
     return {"class": {"id": cid, "name": hit["name"], "count": hit["count"]},
             "nodes": _page(rows, args)}
@@ -403,7 +405,7 @@ def get_heapsnapshot_edges(sess, args, session_dir):
     key = {"retainedSize": lambda r: -r["retained_size"], "selfSize": lambda r: -r["self_size"],
            "name": lambda r: r["name"]}.get(sort_by)
     if key is None:
-        raise ValueError(f"sortBy 必须是 retainedSize/selfSize/name,收到 {sort_by}")
+        raise UsageError(f"sortBy 必须是 retainedSize/selfSize/name,收到 {sort_by}")
     rows.sort(key=key)
     return {"node": {"nodeId": nd["index"], "name": nd["name"]},
             "edges": _page(rows, args), "edge_count": len(rows)}
@@ -503,7 +505,7 @@ def query_heapsnapshot_objects(sess, args, session_dir):
     key = {"retainedSize": lambda r: -r["retained_size"], "selfSize": lambda r: -r["self_size"],
            "id": lambda r: r["nodeId"]}.get(sort_by)
     if key is None:
-        raise ValueError(f"sortBy 必须是 retainedSize/selfSize/id,收到 {sort_by}")
+        raise UsageError(f"sortBy 必须是 retainedSize/selfSize/id,收到 {sort_by}")
     out.sort(key=key)
     total = len(out)
     return {"objects": _page(out, args), "matched": total}

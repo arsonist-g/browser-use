@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
-import { TOOL_REFERENCE, toolHelpText } from "../../lib/tool-help.mjs";
+import { TOOL_REFERENCE, toolHelpText, suggestTools } from "../../lib/tool-help.mjs";
 
 const ROOT = path.dirname(path.dirname(path.dirname(url.fileURLToPath(import.meta.url))));
 
@@ -109,4 +109,16 @@ test("toolHelpText 对必填位置参数渲染 usage 行", () => {
   const h = toolHelpText("fill");
   assert.match(h, /usage: browser-use fill --session=<id> <uid> <value>/);
   assert.match(h, /--includeSnapshot/);
+});
+
+test("suggestTools: 前缀命中优先(短名 → 完整工具名)", () => {
+  assert.deepEqual(suggestTools("navigate"), ["navigate_page"]);
+  // 同为前缀命中时按长度差升序:screencast_stop(差 5)< screencast_start(差 6)< screencast_collect(差 8)
+  assert.deepEqual(suggestTools("screencast"), ["screencast_stop", "screencast_start", "screencast_collect"]);
+});
+
+test("suggestTools: 拼写错误按编辑距离纠错,无关名字不猜测", () => {
+  assert.ok(suggestTools("tak_snapshot").includes("take_snapshot"), "少一个字符的名字应命中 take_snapshot");
+  assert.deepEqual(suggestTools("zzzzzzzz"), []);
+  assert.deepEqual(suggestTools(""), []);
 });

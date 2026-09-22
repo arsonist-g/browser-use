@@ -12,8 +12,13 @@ import time
 import traceback
 
 from . import tools as T
+from .errors import ToolFailure, UnknownTool, UnsupportedError, UsageError, message_of
 from .protocol import elog, error, read_envelope, result
 from .session import BrowserSession
+
+
+def tool_of(req):
+    return (req.get("payload") or {}).get("tool", "?")
 
 
 def main():
@@ -47,6 +52,9 @@ def main():
         except Exception:
             pass
 
+    def since(t0):
+        return int((time.monotonic() - t0) * 1000)
+
     def handle(op, payload):
         if op == "core.startup":
             return sess.start()
@@ -60,7 +68,7 @@ def main():
             tool = payload["tool"]
             fn = getattr(T, tool, None)
             if fn is None:
-                raise NotImplementedError(f"tool {tool} 尚未实现(M2/M3 占位,机制摸底后补齐)")
+                raise UnknownTool(f"未知工具: {tool}(本 build 无此工具名;browser-use help 列出全部工具名)")
             sess.prune_edge_popups()
             sess.observe_page_changes()
             t0 = time.monotonic()
@@ -71,26 +79,38 @@ def main():
         if op == "core.stop":
             sess.stop()
             return {"stopped": True}
-        raise KeyError(f"unknown op: {op}")
+        raise UsageError(f"unknown op: {op}")
 
     while True:
         req = read_envelope()
         if req is None:
             break
         op = req.get("op", "")
+        t0 = time.monotonic()
         try:
             if op == "__bad__":
-                raise ValueError("bad json line")
+                raise UsageError("bad json line")
             result(req, handle(op, req.get("payload") or {}))
+        except ToolFailure as e:
+            # 归类过的失败:码与 retryable 由异常类自己给出(errors.py)
+            error(req, e.code, message_of(e), retryable=e.retryable)
+            if op == "tool.call":
+                log_tool(tool_of(req), {}, False, e.code, since(t0))
+        except TimeoutError as e:
+            # 库/控制流信号(如 CDP 命令超时):预算类,值得重试
+            error(req, "TIMEOUT", message_of(e), retryable=True)
+            if op == "tool.call":
+                log_tool(tool_of(req), {}, False, "TIMEOUT", since(t0))
         except NotImplementedError as e:
-            error(req, "NOT_IMPLEMENTED", str(e))
-        except KeyError as e:
-            error(req, "INVALID_ARG", str(e))
+            # 历史写法,统一按"有意不支持"上报;新代码用 UnsupportedError
+            error(req, UnsupportedError.code, message_of(e))
+            if op == "tool.call":
+                log_tool(tool_of(req), {}, False, UnsupportedError.code, since(t0))
         except Exception as e:
             elog("core-error", traceback.format_exc(limit=6))
-            error(req, "TOOL_ERROR", str(e), retryable=True)
+            error(req, "INTERNAL", message_of(e))
             if op == "tool.call":
-                log_tool((req.get("payload") or {}).get("tool", "?"), {}, False, "TOOL_ERROR")
+                log_tool(tool_of(req), {}, False, "INTERNAL", since(t0))
 
 
 def _redact(args):

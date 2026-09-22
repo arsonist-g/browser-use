@@ -1,5 +1,5 @@
 // 单元测试:skill 安装逻辑(路径拼接 / 复制 / 状态判定 / 覆盖保护)
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -10,9 +10,19 @@ import { AGENTS, skillTargetDir, skillStatus, installSkill, uninstallSkill, bund
 
 const ROOT = path.dirname(path.dirname(path.dirname(url.fileURLToPath(import.meta.url))));
 
+// 临时 home 一律登记后统一删除:漏删会让 %TEMP% 每跑一次测试多一批目录(实测残留 30+ 个)
+const TMP_HOMES = [];
 function tmpHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "bu-skill-test-"));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "bu-skill-test-"));
+  TMP_HOMES.push(d);
+  return d;
 }
+
+after(() => {
+  for (const d of TMP_HOMES) {
+    if (d.startsWith(os.tmpdir())) fs.rmSync(d, { recursive: true, force: true, maxRetries: 5 });
+  }
+});
 
 test("AGENTS: key 唯一且 dir 为安全的 home 相对路径", () => {
   const keys = AGENTS.map((a) => a.key);

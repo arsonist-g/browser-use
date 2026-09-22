@@ -10,6 +10,7 @@ import time
 
 from . import humanize
 from .cdp_events import ensure_session_cdp
+from .errors import BlockedError, PageError, StateExpiredError, TimeoutExceeded, UnsupportedError, UsageError
 from .snapshot import build_snapshot
 
 
@@ -69,7 +70,7 @@ def _check_dialog(sess):
         if d.get("type") == "beforeunload":
             _handle_dialog_action(sess, "accept")
             return
-        raise ValueError(f'A dialog is open ({d.get("type")}: {d.get("message")})。'
+        raise BlockedError(f'A dialog is open ({d.get("type")}: {d.get("message")})。'
                          f" Use handle_dialog to accept or dismiss it first.")
 
 
@@ -148,16 +149,16 @@ def _uid_point(sess, uid):
     主 session quads 已是主视口系(Blink absolute 坐标),不换算。"""
     node = sess.uid_map.get(uid)
     if not node:
-        raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
+        raise StateExpiredError(f"uid {uid} 已失效,请重新 take_snapshot")
     bnn = node.get("backendDOMNodeId")
     if not bnn:
-        raise KeyError(f"uid {uid} 无对应 DOM 节点")
+        raise StateExpiredError(f"uid {uid} 无对应 DOM 节点(请重新 take_snapshot)")
     cdp = _node_channel(sess, uid)
     cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=bnn)
     res = cdp("DOM.getContentQuads", backendNodeId=bnn)
     quads = res.get("quads") or []
     if not quads:
-        raise KeyError(f"uid {uid} 无可见几何(可能不在渲染树)")
+        raise StateExpiredError(f"uid {uid} 无可见几何(可能不在渲染树;请重新 take_snapshot)")
     q = quads[0]  # [x1,y1,x2,y2,...] 4 角
     xs, ys = q[0::2], q[1::2]
     fx = sum(xs) / len(xs)
@@ -227,19 +228,19 @@ def _frame_origin_in_main(sess, uid, fid):
             break  # 主 frame(无宿主):链顶,正常终点
         rec = owners.get(fid)
         if not rec or not rec[0]:
-            raise KeyError(f"uid {uid} 的 iframe 坐标换算失败(宿主链不完整),请重新 take_snapshot")
+            raise StateExpiredError(f"uid {uid} 的 iframe 坐标换算失败(宿主链不完整),请重新 take_snapshot")
         if not cdp:
             break  # ws 不可用:换算不可得,维持原坐标(降级同旧行为)
         try:
             p = _host_point(cdp, rec[0], rec[1])
             if p is None:
-                raise KeyError(f"uid {uid} 的 iframe 坐标换算失败(宿主元素解析为空),请重新 take_snapshot")
+                raise StateExpiredError(f"uid {uid} 的 iframe 坐标换算失败(宿主元素解析为空),请重新 take_snapshot")
             ox += p[0]
             oy += p[1]
         except KeyError:
             raise
         except Exception as e:
-            raise KeyError(f"uid {uid} 的 iframe 坐标换算失败({e}),请重新 take_snapshot") from e
+            raise StateExpiredError(f"uid {uid} 的 iframe 坐标换算失败({e}),请重新 take_snapshot") from e
         fid = info["parent"]
     return (ox, oy)
 
@@ -267,7 +268,8 @@ def _uid_quad(sess, uid):
             except Exception:
                 pass
     if hit == "null":
-        raise KeyError(f"uid {uid} 滚动后仍不可点(坐标 {fx:.0f},{fy:.0f} 处无元素命中)")
+        raise StateExpiredError(f"uid {uid} 滚动后仍不可点(坐标 {fx:.0f},{fy:.0f} 处无元素命中;"
+                                f"请重新 take_snapshot 后重试)")
     return (vx, vy)
 
 
@@ -429,7 +431,7 @@ def _select_native_option(sess, uid, node):
                     }""")
     out = (res.get("result") or {}).get("value") or {}
     if out.get("error") and out["error"] != "no-select":
-        raise ValueError(out["error"])
+        raise PageError(out["error"])
     return bool(out.get("ok"))
 
 
@@ -438,7 +440,7 @@ def click(sess, args, session_dir):
     _check_dialog(sess)
     node = sess.uid_map.get(uid)
     if not node:
-        raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
+        raise StateExpiredError(f"uid {uid} 已失效,请重新 take_snapshot")
     # cdt 增强:非双击且节点 role=option → 原生 select 选值
     if not args.get("dblClick") and (node.get("role") or {}).get("value") == "option":
         if _select_native_option(sess, uid, node):
@@ -478,7 +480,7 @@ def drag(sess, args, session_dir):
     x1, y1 = _uid_quad(sess, from_uid)
     x2, y2 = _uid_quad(sess, to_uid)
     if bool(frames.get(from_uid)) != bool(frames.get(to_uid)):
-        raise ValueError("cross-frame drag is not supported: from_uid and to_uid must be in the same frame")
+        raise UnsupportedError("cross-frame drag is not supported: from_uid and to_uid must be in the same frame")
     # 坐标已换算主视口系:按下/拖动/抬起统一主 session 派发(浏览器 hit-test 路由)
     send = _input_channel(sess)
     humanize.move_mouse(t, x1, y1, dispatch=send)
@@ -499,7 +501,7 @@ def fill(sess, args, session_dir):
     _check_dialog(sess)
     node = sess.uid_map.get(uid)
     if not node:
-        raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
+        raise StateExpiredError(f"uid {uid} 已失效,请重新 take_snapshot")
     bnn = node.get("backendDOMNodeId")
     sid = getattr(sess, "uid_frames", {}).get(str(uid))
     dispatch = _input_channel(sess)  # Input 派发统一走主 session ws(DP 弹窗检查会拒发)
@@ -525,7 +527,7 @@ def fill(sess, args, session_dir):
                              session_id=sid or None, backendNodeId=bnn)
                 oid = (r.get("object") or {}).get("objectId")
                 if not oid:
-                    raise KeyError(f"uid {uid} 无法解析为页面元素")
+                    raise StateExpiredError(f"uid {uid} 无法解析为页面元素")
                 return cdp.call("Runtime.callFunctionOn", timeout=15,
                                 session_id=sid or None, objectId=oid, returnByValue=True,
                                 arguments=[{"value": value}],
@@ -537,14 +539,14 @@ def fill(sess, args, session_dir):
                         _handle_dialog_action(sess, action)
                         continue
                 raise
-        raise TimeoutError("fill timed out")
+        raise TimeoutExceeded("fill timed out")
 
     res = _resolve_and_call()
     kind = (res.get("result") or {}).get("value")
     if isinstance(kind, str) and kind.startswith("ERR:"):
         # 错误层级对齐 cdt handleActionError:主信息 = 交互失败包装行(uid 级),
         # 具体原因附后(上游原因仅入日志;CLI 单通道场景内联保留可诊断性)
-        raise ValueError(f"Failed to interact with the element with uid {uid}. "
+        raise TimeoutExceeded(f"Failed to interact with the element with uid {uid}. "
                          f"The element did not become interactive within the configured "
                          f"timeout. ({kind[4:]})")
     nav = _wait_after_action(sess)
@@ -588,7 +590,7 @@ def upload_file(sess, args, session_dir):
     _check_dialog(sess)
     node = sess.uid_map.get(uid)
     if not node:
-        raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
+        raise StateExpiredError(f"uid {uid} 已失效,请重新 take_snapshot")
     files = args.get("filePaths") if isinstance(args.get("filePaths"), list) else [args.get("filePaths")]
     abs_files = [os.path.abspath(f) for f in files if f]
     bnn = node.get("backendDOMNodeId")
@@ -599,7 +601,7 @@ def upload_file(sess, args, session_dir):
     except Exception:
         pass  # 元素非 file input → 走 file chooser 兜底(cdt 同;仅主 frame)
     if getattr(sess, "uid_frames", {}).get(str(uid)):
-        raise ValueError("Failed to upload file: the element is not a file input (cross-frame chooser fallback is not supported)")
+        raise UsageError("Failed to upload file: the element is not a file input (cross-frame chooser fallback is not supported)")
     if getattr(sess, "_cdp", None) is None:
         from .cdp_events import ensure_session_cdp
         ensure_session_cdp(sess)
@@ -618,7 +620,7 @@ def upload_file(sess, args, session_dir):
                 break
             time.sleep(0.05)
         if chooser_bnn is None:
-            raise RuntimeError("Failed to upload file. The element could not accept the file "
+            raise PageError("Failed to upload file. The element could not accept the file "
                                "directly, and clicking it did not trigger a file chooser.")
         # 现代 puppeteer 的 FileChooser.accept = 对 chooser 元素 DOM.setFileInputFiles
         # (Page.handleFileChooser 已从 CDP 移除)
@@ -644,7 +646,7 @@ def handle_dialog(sess, args, session_dir):
     if cdp:
         cdp.pump()
         if not cdp.dialog_state:
-            raise ValueError("No open dialog found")  # 文案对齐 cdt(事件状态无弹窗)
+            raise UsageError("No open dialog found")  # 文案对齐 cdt(事件状态无弹窗)
     try:
         if cdp:
             cdp.call("Page.handleJavaScriptDialog", timeout=10, **kwargs)
@@ -654,7 +656,7 @@ def handle_dialog(sess, args, session_dir):
         if cdp and cdp.dialog_state and "No dialog" in str(e):
             pass  # 状态有但实际已消失(外部处理):对齐 cdt 仅 log 并报成功
         elif "No dialog" in str(e):
-            raise ValueError("No open dialog found") from None
+            raise UsageError("No open dialog found") from None
         else:
             raise
     # 命令成功 = 弹窗已关闭;ws 的 closed 事件可能滞后,主动清预检状态
@@ -845,7 +847,8 @@ def new_page(sess, args, session_dir):
 
 def _new_tab_in_context(sess, name, url, background):
     """命名隔离上下文:同名复用同一 browser context(cdt 语义),跨 context 完全隔离。
-    Target.createBrowserContext/createTarget 为 browser 端点命令,经 daemon pipe 通道。"""
+    Target.createBrowserContext/createTarget 为 browser 端点命令,经 daemon 的浏览器级
+    CDP 端点转发(daemon 走浏览器级 ws,port-only 会话下同样可用)。"""
     from .cdp_events import pipe_call
     ctx_map = getattr(sess, "_isolated_contexts", None)
     if ctx_map is None:
@@ -862,7 +865,7 @@ def _new_tab_in_context(sess, name, url, background):
             if getattr(tb, "_target_id", None) == tid or getattr(tb, "tab_id", None) == tid:
                 return tb
         time.sleep(0.2)
-    raise RuntimeError(f"isolated context 页创建未就绪: {tid}")
+    raise TimeoutExceeded(f"isolated context 页创建未就绪: {tid}")
 
 
 def list_pages(sess, args, session_dir):
@@ -879,7 +882,7 @@ def close_page(sess, args, session_dir):
     tabs = sess.browser.get_tabs()
     idx = int(args["page_id"])
     if len(tabs) <= 1:
-        raise ValueError("The last open page cannot be closed. It is fine to keep it open.")  # 文案对齐 cdt
+        raise UsageError("The last open page cannot be closed. It is fine to keep it open.")  # 文案对齐 cdt
     sess.browser.close_tabs(tabs[idx])
     return {"closed": str(args["page_id"])}
 
@@ -894,42 +897,52 @@ def wait_for(sess, args, session_dir):
     deadline = time.time() + timeout
     cdp = _session_cdp_safe(sess)
 
-    def _aria_hit(txt):
+    def _aria_hit(txt, deadline):
         # accessible name 通道:aria-label/title/alt(上游 aria/ locator 的近似覆盖)
         esc = txt.replace("\\", "\\\\").replace('"', '\\"')
         js = (f'(function(){{ const esc = "{esc}";'
               f' if (document.querySelector(\'[aria-label="\'+esc+\'"], [title="\'+esc+\'"]\')) return true;'
               f' return [...document.images].some(i => (i.alt || "") === esc); }})()')
         if cdp:
+            left = deadline - time.time()
+            if left <= 0:
+                return False
             try:
-                if _cdp_eval(cdp, js, timeout=2):
+                if _cdp_eval(cdp, js, timeout=min(2.0, left)):
                     return True
             except Exception:
                 pass
         return False
 
-    def _hit(txt):
+    def _hit(txt, deadline):
         # 短超时轮询:DP ele 默认等待 10s,会把 miss 变成长阻塞并拖垮后续命令
+        # 每次探测前看表:单次探测(DP 0.3s / aria 2s)是超时的最小粒度,预算到点即收手。
+        # 单轮超支必须小于传输层余量(daemon 侧 +5s),否则工具自己的 TIMEOUT 会被传输层
+        # 抢走,AI 拿到"CORE_TIMEOUT 请重试"——重试无用,真原因是文本没等到
+        if time.time() >= deadline:
+            return False
         try:
             if t.ele(f"text:{txt}", timeout=0.3):
                 return True
         except Exception:
             pass
         for fr in _iter_frames(t):
+            if time.time() >= deadline:
+                return False
             try:
                 if fr.ele(f"text:{txt}", timeout=0.3):
                     return True
             except Exception:
                 continue
-        return _aria_hit(txt)
+        return _aria_hit(txt, deadline)
 
     while time.time() < deadline:
         for txt in texts:
-            if _hit(txt):
+            if _hit(txt, deadline):
                 snap = build_snapshot(sess)
                 return {"found": txt, "snapshot": snap["text"], "uid_count": snap["uid_count"]}
         time.sleep(0.3)
-    raise TimeoutError(f"文本未出现: {texts} ({timeout}s)")
+    raise TimeoutExceeded(f"文本未出现: {texts} ({timeout}s)")
 
 
 def _iter_frames(t):
@@ -950,22 +963,22 @@ def take_screenshot(sess, args, session_dir):
     _check_dialog(sess)
     fmt = args.get("format") or "png"
     if fmt not in ("png", "jpeg", "webp"):
-        raise ValueError(f"format 必须是 png/jpeg/webp,收到 {fmt}")
+        raise UsageError(f"format 必须是 png/jpeg/webp,收到 {fmt}")
     uid, full = args.get("uid"), bool(args.get("fullPage"))
     if uid and full:
-        raise ValueError('Providing both "uid" and "fullPage" is not allowed.')
+        raise UsageError('Providing both "uid" and "fullPage" is not allowed.')
     quality = args.get("quality") if fmt in ("jpeg", "webp") else None
     clip = None
     if uid:
         node = sess.uid_map.get(str(uid))
         if not node:
-            raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
+            raise StateExpiredError(f"uid {uid} 已失效,请重新 take_snapshot")
         bnn = node.get("backendDOMNodeId")
         cdp = _node_channel(sess, str(uid))
         cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=bnn)
         quads = (cdp("DOM.getContentQuads", backendNodeId=bnn) or {}).get("quads") or []
         if not quads:
-            raise KeyError(f"uid {uid} 无可见几何(可能不在渲染树)")
+            raise StateExpiredError(f"uid {uid} 无可见几何(可能不在渲染树)")
         q = quads[0]
         xs, ys = q[0::2], q[1::2]
         ox, oy = (0.0, 0.0)
@@ -1013,14 +1026,14 @@ def evaluate_script(sess, args, session_dir):
     if uid_args:
         sids = {getattr(sess, "uid_frames", {}).get(str(u)) for u in uid_args}
         if len(sids) > 1:
-            raise ValueError("evaluate_script: args must be in the same frame "
+            raise UsageError("evaluate_script: args must be in the same frame "
                              "(object handles are not transferable across frames)")
         frame_sid = sids.pop()
         handles = []
         for uid in uid_args:
             node = sess.uid_map.get(str(uid))
             if not node:
-                raise KeyError(f"uid {uid} 已失效,请重新 take_snapshot")
+                raise StateExpiredError(f"uid {uid} 已失效,请重新 take_snapshot")
             ch = _node_channel(sess, str(uid))
             try:
                 r = ch("DOM.resolveNode", backendNodeId=node.get("backendDOMNodeId"))
@@ -1029,7 +1042,7 @@ def evaluate_script(sess, args, session_dir):
                 r = ch("DOM.resolveNode", backendNodeId=node.get("backendDOMNodeId"))
             oid = (r.get("object") or {}).get("objectId")
             if not oid:
-                raise KeyError(f"uid {uid} 无法解析为页面元素")
+                raise StateExpiredError(f"uid {uid} 无法解析为页面元素")
             handles.append({"objectId": oid})
         res = _eval_fn(sess, frame_sid, fn, dialog_action, handles)
     else:
@@ -1037,7 +1050,7 @@ def evaluate_script(sess, args, session_dir):
     detail = res.get("exceptionDetails")
     if detail:
         text = (detail.get("exception", {}) or {}).get("description") or detail.get("text", "evaluate failed")
-        raise ValueError(f"evaluate_script 执行失败: {text.strip()}")
+        raise PageError(f"evaluate_script 执行失败: {text.strip()}")
     val = res.get("result", {}).get("value")
     if isinstance(val, str):
         try:
@@ -1068,7 +1081,7 @@ def _eval_fn(sess, frame_sid, fn, dialog_action, handles, attempt=0):
                  returnByValue=False, userGesture=True)
         foid = (f.get("result") or {}).get("objectId")
         if not foid:
-            raise ValueError("evaluate_script: 函数声明无法解析为可调用对象")
+            raise UsageError("evaluate_script: 函数声明无法解析为可调用对象")
         try:
             return send("Runtime.callFunctionOn", objectId=foid,
                         functionDeclaration="function (...args) { return this(...args); }",
@@ -1166,7 +1179,7 @@ def get_console_message(sess, args, session_dir):
     buf = getattr(sess, "_console_buffer", None)
     idx = int(args["msgid"])
     if not buf or idx < 0 or idx >= len(buf):
-        raise ValueError("Request not found for selected page")  # 文案对齐 cdt PageCollector.getById
+        raise StateExpiredError("Request not found for selected page")  # 文案对齐 cdt PageCollector.getById
     return {"message": buf[idx]}
 
 
@@ -1329,7 +1342,7 @@ def get_network_request(sess, args, session_dir):
     buf = getattr(sess, "_net_buffer", None)
     idx = int(args["reqid"])
     if not buf or idx < 0 or idx >= len(buf):
-        raise ValueError("Request not found for selected page")  # 文案对齐 cdt PageCollector.getById
+        raise StateExpiredError("Request not found for selected page")  # 文案对齐 cdt PageCollector.getById
     p = buf[idx]
     body = _packet_body(p)
     if isinstance(p, dict):
@@ -1401,7 +1414,7 @@ def resize_page(sess, args, session_dir):
         t.run_cdp("Browser.setContentsSize", windowId=wid,
                   width=int(args["width"]), height=int(args["height"]))
     except Exception as e:
-        raise RuntimeError(f"resize_page 失败(浏览器不支持 Browser.setContentsSize): {e}") from None
+        raise UnsupportedError(f"resize_page 失败(浏览器不支持 Browser.setContentsSize): {e}") from None
     return {"done": True}
 
 
@@ -1426,12 +1439,21 @@ def emulate(sess, args, session_dir):
     UA/viewport 为 CONSTRAINT-001 红线权衡,不实现也不在重置面。"""
     t = sess.t
     _check_dialog(sess)  # 上游 emulate blockedByDialog=true
+    # 红线维度:本 build 有意不做,必须显式拒绝。静默忽略会返回 done:true,AI 据此以为
+    # UA/视口已改,后续判断(反爬、布局)全建立在一个没发生的事实上——比报错更坏。
+    # 校验先于应用:拒绝时不改动任何仿真状态(与上游 schema 先行一致)。
+    for key in ("userAgent", "user_agent", "viewport", "platform", "language", "acceptLanguage"):
+        if args.get(key) is not None:
+            raise UnsupportedError(
+                f"emulate 不支持 {key}(反爬红线:UA/视口/平台/语言覆盖会与 TLS、行为信号不一致,"
+                f"覆盖本身即检测信号)。可用的仿真维度:networkConditions / cpuThrottlingRate / "
+                f"geolocation / colorScheme / extraHttpHeaders")
     nc = args.get("networkConditions")
     if nc is not None and nc != "Offline" and nc not in _PREDEFINED_NETWORK:
-        raise ValueError(f"networkConditions 必须是 Offline/{' / '.join(_PREDEFINED_NETWORK)},收到 {nc}")
+        raise UsageError(f"networkConditions 必须是 Offline/{' / '.join(_PREDEFINED_NETWORK)},收到 {nc}")
     rate = args.get("cpuThrottlingRate")
     if rate is not None and not (1 <= rate <= 20):
-        raise ValueError(f"cpuThrottlingRate 必须在 1-20,收到 {rate}")
+        raise UsageError(f"cpuThrottlingRate 必须在 1-20,收到 {rate}")
     geo = args.get("geolocation")
     lat = lng = 0.0
     if geo is not None:
@@ -1439,12 +1461,12 @@ def emulate(sess, args, session_dir):
             lat_s, lng_s = str(geo).split(",")
             lat, lng = float(lat_s), float(lng_s)
         except ValueError:
-            raise ValueError(f'geolocation 需为 "<latitude>,<longitude>" 格式,收到 {geo}') from None
+            raise UsageError(f'geolocation 需为 "<latitude>,<longitude>" 格式,收到 {geo}') from None
         if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-            raise ValueError(f"geolocation 超出范围: {geo}")
+            raise UsageError(f"geolocation 超出范围: {geo}")
     cs = args.get("colorScheme")
     if cs is not None and cs not in ("dark", "light", "auto"):
-        raise ValueError(f"colorScheme 必须是 dark/light/auto,收到 {cs}")
+        raise UsageError(f"colorScheme 必须是 dark/light/auto,收到 {cs}")
     headers = args.get("extraHttpHeaders")
     parsed_headers = None
     if headers is not None:
@@ -1454,9 +1476,9 @@ def emulate(sess, args, session_dir):
             try:
                 parsed_headers = json.loads(headers)
             except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON for headers: {e}") from None
+                raise UsageError(f"Invalid JSON for headers: {e}") from None
             if not isinstance(parsed_headers, dict):
-                raise ValueError("Headers must be a JSON object")
+                raise UsageError("Headers must be a JSON object")
 
     # ---- 校验完毕,应用(未提及维度全量重置)----
     if nc is None:
@@ -1495,7 +1517,7 @@ def scroll_unknown_state(sess, args, session_dir):
     return settle_check(sess)
 
 
-# ---- M2/M3 挂载(performance/memory/advanced)——57 工具全量注册 ----
+# ---- performance/memory/advanced 挂载:三个模块的公开函数即注册的工具(工具清单见 lib/tool-help.mjs) ----
 from . import advanced as _adv  # noqa: E402
 from . import memory as _mem  # noqa: E402
 from . import performance as _perf  # noqa: E402

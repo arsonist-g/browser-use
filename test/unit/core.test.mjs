@@ -36,7 +36,7 @@ test("config: set/set 类型转换/reset 单键恢复默认", () => {
     assert.equal(loadConfig(true).tool_default_timeout_ms, 45000, "字符串数字 → number");
     setConfigKey("disable_extensions", "true");
     assert.equal(loadConfig(true).disable_extensions, true, "字符串 → bool");
-    assert.throws(() => setConfigKey("not_a_key", "1"), /unknown config key/);
+    assert.throws(() => setConfigKey("not_a_key", "1"), /未知配置键: not_a_key/);
   } finally {
     resetConfigKey("tool_default_timeout_ms");
     resetConfigKey("disable_extensions");
