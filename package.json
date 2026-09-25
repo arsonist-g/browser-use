@@ -31,7 +31,7 @@
   "scripts": {
     "start": "node bin/browser-use.mjs",
     "lint:py": "python -m ruff check core/bu_core",
-    "test": "npm run lint:py && node --test test/unit/core.test.mjs test/unit/skills.test.mjs test/unit/tool-help.test.mjs test/unit/permissions.test.mjs test/unit/headless-ban.test.mjs test/unit/unknown-tool.test.mjs test/unit/error-contract.test.mjs test/unit/config-cli.test.mjs test/unit/cli-daemon-port.test.mjs test/unit/port-only-channel.test.mjs test/unit/builtin-page-follow.test.mjs test/unit/daily-browser.test.mjs",
+    "test": "npm run lint:py && node --test test/unit/core.test.mjs test/unit/skills.test.mjs test/unit/tool-help.test.mjs test/unit/permissions.test.mjs test/unit/headless-ban.test.mjs test/unit/unknown-tool.test.mjs test/unit/error-contract.test.mjs test/unit/config-cli.test.mjs test/unit/cli-daemon-port.test.mjs test/unit/port-only-channel.test.mjs test/unit/builtin-page-follow.test.mjs test/unit/daily-browser.test.mjs test/unit/daemon-lifecycle.test.mjs",
     "e2e": "node test/e2e.mjs",
     "all-tools": "node test/all-tools.mjs"
   }

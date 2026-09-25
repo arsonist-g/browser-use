@@ -10,6 +10,7 @@ import url from "node:url";
 import { ERROR_CODES, exitCodeFor } from "../lib/error-codes.mjs";
 import { cliRpcTimeoutMs, toolBudgetMs } from "../lib/budget.mjs";
 import { loadConfig } from "../lib/config.mjs";
+import { BU_HOME } from "../lib/paths.mjs";
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 // 版本号单一来源 = package.json(此前硬编码曾连续两版未同步)
@@ -92,16 +93,87 @@ function daemonAlive() {
   });
 }
 
-async function ensureDaemon() {
-  if (await daemonAlive()) return;
-  // 单例探活失败 → 后台拉起(分离进程,不随 CLI 退出)。windowsHide:detached 会让
-  // node 子进程开自己的控制台(黑窗常驻),必须显式隐藏
-  const daemonJs = path.join(ROOT, "lib", "daemon.mjs");
-  const child = spawn(process.execPath, [daemonJs], {
-    detached: true, stdio: "ignore", windowsHide: true,
-    env: { ...process.env },
+// ---- daemon 启动:必须活过"启动它的那条命令" ----
+// 有些执行环境(agent 的 Bash 工具)在命令结束时回收整棵进程树:普通 detached spawn 起的 daemon 会在
+// 那一刻被 TerminateProcess 砍掉(实测:日志里连 exit 行都没有,只剩一段空白),而 daemon 一死,
+// 带 --remote-debugging-pipe 的会话浏览器与 core 会立即跟着退出 —— 用户看到的就是"浏览器窗口刚打开就闪退"。
+// WMI 创建的进程父进程是 WMI 提供程序,既不在调用方的 job 里、也不在它的父子链上,能活过命令边界(实测)。
+// 但 WMI 直接起 node.exe 会给它分配控制台:Win11 默认终端是 Windows Terminal 时,那会变成用户屏幕上
+// 弹出的一个可见 WT 窗口(实测 visible=True,title=node.exe 路径)—— 所以中间套一层 `conhost --headless`:
+// conhost 自己是 GUI 进程、给子进程一个无窗口控制台(实测控制台窗口数 0,node 正常运行)。
+// 环境:WMI 起的进程不继承调用方环境,所以把 daemon 及其子进程真正需要的变量写进一个 launcher,由它带着环境 import daemon。
+// 只列必需项而不是整份环境:整份环境会把这台机器上各种凭据一并落到文件里,而 daemon 只需要这些。
+const DAEMON_ENV_KEYS = [
+  "BROWSER_USE_HOME", "BU_DAEMON_PORT",
+  "BU_DEV_ALLOW_HEADLESS", "BU_DEV_FORCE_PORT_ONLY", "BU_DEV_NO_DAILY_AUTOSTART",
+  "PATH", "PATHEXT", "SystemRoot", "windir", "COMSPEC", "TEMP", "TMP",
+  "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+  "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "SESSIONNAME",
+  "PYTHONHOME", "PYTHONPATH", "CONDA_PREFIX",   // core 用 PATH 上的 python 起,这几项覆盖非默认解释器布局
+];
+const daemonJsPath = () => path.join(ROOT, "lib", "daemon.mjs");
+const daemonLauncherPath = () => path.join(BU_HOME, "daemon-launch.mjs");
+
+/** 写 launcher:先落环境(daemon 里的 paths.mjs 在 import 时就读 env),再 import 真正的 daemon。 */
+function writeDaemonLauncher() {
+  const env = {};
+  for (const k of DAEMON_ENV_KEYS) if (process.env[k] !== undefined) env[k] = process.env[k];
+  fs.mkdirSync(BU_HOME, { recursive: true });
+  fs.writeFileSync(daemonLauncherPath(), [
+    "// browser-use CLI 生成(每次拉起 daemon 时覆写):WMI 起的进程不继承调用方环境,这里补上再拉起 daemon",
+    `Object.assign(process.env, ${JSON.stringify(env)});`,
+    `await import(${JSON.stringify(url.pathToFileURL(daemonJsPath()).href)});`,
+    "",
+  ].join("\n"));
+  return daemonLauncherPath();
+}
+
+/**
+ * WMI 创建(活过命令边界)。必须套一层 `conhost --headless`:WMI 直接起 node.exe 会为它分配一个
+ * 控制台,Win11 默认终端为 Windows Terminal 时那会变成屏幕上弹出的一个可见 WT 窗口(实测 visible=True,
+ * title 就是 node.exe 的路径);conhost 自己是 GUI 进程,`--headless` 给子进程一个无窗口控制台
+ * (实测控制台窗口数 0,node 正常运行)。非 Windows / WMI 不可用 / 超时 → null,由调用方退回普通 detached spawn。
+ */
+function spawnDaemonViaWmi(launcher, timeoutMs = 15000) {
+  if (process.platform !== "win32") return Promise.resolve(null);
+  const cmd = `conhost.exe --headless "${process.execPath}" "${launcher}"`;
+  const ps = "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments " +
+    `@{CommandLine='${cmd.replace(/'/g, "''")}'} | Select-Object -ExpandProperty ProcessId`;
+  return new Promise((resolve) => {
+    let out = "";
+    let child;
+    try {
+      child = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps],
+        { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    } catch { return resolve(null); }
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* */ } resolve(null); }, timeoutMs);
+    child.stdout.on("data", (d) => (out += d));
+    child.on("error", () => { clearTimeout(timer); resolve(null); });
+    child.on("close", () => {
+      clearTimeout(timer);
+      const pid = Number(String(out).trim().split(/\s+/).filter(Boolean).pop());
+      resolve(Number.isFinite(pid) && pid > 0 ? pid : null);
+    });
+  });
+}
+
+/** 兜底路径:普通 detached spawn(环境天然继承,但在回收进程树的环境里活不过这条命令)。 */
+function spawnDaemonDirect() {
+  const child = spawn(process.execPath, [daemonJsPath()], {
+    detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env },
   });
   child.unref();
+  return child.pid ?? null;
+}
+
+async function ensureDaemon() {
+  if (await daemonAlive()) return;
+  const viaWmi = await spawnDaemonViaWmi(writeDaemonLauncher());
+  if (!viaWmi) {
+    errOut("warning: WMI 拉起 daemon 失败,退回普通 detached(spawn);若本环境在命令结束时回收进程树,"
+      + "daemon 会随之消失、会话浏览器也会跟着关掉\n");
+    spawnDaemonDirect();
+  }
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
     if (await daemonAlive()) return;
