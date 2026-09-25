@@ -26,24 +26,33 @@ def _live_url(sess):
         return sess.t.url
 
 
-def _node_channel(sess, uid):
+def _node_channel(sess, uid, wait=True):
     """uid 节点的 CDP 调用器 fn(method, **params):统一走会话 CdpEvents ws 通道
     (带超时,不经 DP 的弹窗前置检查——弹窗场景 Input 派发行为对齐上游);OOPIF 时
-    带 sessionId 路由(backendNodeId 与坐标系均属该 frame)。ws 不可用回退 DP 通道。"""
+    带 sessionId 路由(backendNodeId 与坐标系均属该 frame)。ws 不可用回退 DP 通道。
+    wait=False 不等 ACK:同 session 上 CDP 保序,随后阻塞调用的返回即代表前面的
+    命令已执行。"""
     sid = getattr(sess, "uid_frames", {}).get(str(uid))
     cdp = _session_cdp_safe(sess)
     if not cdp:
         return lambda m, **kw: sess.t.run_cdp(m, **kw)
+    if not wait:
+        return lambda m, **kw: cdp.fire(m, session_id=sid or None, **kw)
     return lambda m, **kw: cdp.call(m, timeout=15, session_id=sid or None, **kw)
 
 
-def _input_channel(sess):
+def _input_channel(sess, wait=True):
     """Input 域派发通道:主 session 的 ws 调用器。uid 消费的坐标已换算为主视口系,
     主 session 派发后浏览器 hit-test 自动路由进跨域 iframe;ws 绕 DP 弹窗前置检查
-    (DEC-018)。ws 不可用回退 DP 通道。"""
+    (DEC-018)。ws 不可用回退 DP 通道。
+    wait=False 不等 ACK:轨迹点/按下抬起/逐字按键这类"顺序即语义"的批量派发用它,
+    否则每个事件都要等渲染主线程回执,页面越忙命令越慢(繁忙页一次 click 实测
+    3.0-6.0s,不等 ACK 后 2.0s,且不再随鼠标移动距离增长)。"""
     cdp = _session_cdp_safe(sess)
     if not cdp:
         return lambda m, **kw: sess.t.run_cdp(m, **kw)
+    if not wait:
+        return lambda m, **kw: cdp.fire(m, session_id=None, **kw)
     return lambda m, **kw: cdp.call(m, timeout=15, session_id=None, **kw)
 
 
@@ -64,7 +73,9 @@ def _check_dialog(sess):
     cdp = _session_cdp_safe(sess)
     if not cdp:
         return
-    cdp.pump()
+    # 非阻塞收帧:预检只关心"此刻有没有已到达的弹窗事件"。用 pump 会在无帧可读时
+    # 白等满 socket 超时(实测 ~250ms),而它是每条交互命令(click/fill/type/hover/drag/press)的固定开销
+    cdp.drain(0)
     if cdp.dialog_state:
         d = cdp.dialog_state
         if d.get("type") == "beforeunload":
@@ -107,7 +118,7 @@ def _wait_after_action(sess, timeout_s=1.5):
     probe_until = time.time() + 0.08
     while time.time() < probe_until:
         if cdp:
-            cdp.pump()
+            cdp.drain(0)   # 预检不为等待买单(同 _check_dialog)
             if cdp.dialog_state:
                 return None
         u = _href(0.3)
@@ -154,7 +165,9 @@ def _uid_point(sess, uid):
     if not bnn:
         raise StateExpiredError(f"uid {uid} 无对应 DOM 节点(请重新 take_snapshot)")
     cdp = _node_channel(sess, uid)
-    cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=bnn)
+    # 滚动不等 ACK:同 session 上 CDP 保序,getContentQuads 返回时滚动必然已生效。
+    # 等一次 ACK 就多一个渲染主线程往返,繁忙页面上是数百毫秒
+    _node_channel(sess, uid, wait=False)("DOM.scrollIntoViewIfNeeded", backendNodeId=bnn)
     res = cdp("DOM.getContentQuads", backendNodeId=bnn)
     quads = res.get("quads") or []
     if not quads:
@@ -375,7 +388,7 @@ def scroll(sess, args, session_dir):
     if uid:
         vx, vy = _uid_quad(sess, uid)
         dispatch = _input_channel(sess)
-        humanize.move_mouse(t, vx, vy, dispatch=dispatch)
+        humanize.move_mouse(t, vx, vy, dispatch=dispatch, fire=_input_channel(sess, wait=False))
     else:
         dispatch = None
         # 滚轮落点必须在内:取视口中心(写死坐标会超出小视口)
@@ -450,7 +463,8 @@ def click(sess, args, session_dir):
     # 进跨域 iframe;DP 的弹窗前置检查会拒发 mouseReleased,上游无此阻塞)
     dispatch = _input_channel(sess)
     try:
-        humanize.click_xy(sess.t, vx, vy, dbl=bool(args.get("dblClick")), dispatch=dispatch)
+        humanize.click_xy(sess.t, vx, vy, dbl=bool(args.get("dblClick")),
+                          dispatch=dispatch, fire=_input_channel(sess, wait=False))
     except TimeoutError:
         # 点击已发生(alert 等弹窗在按下/抬起间弹出阻塞 renderer,Released 的 ACK 不回)。
         # 对齐上游 dialogHandled 语义:不作工具失败,dialog 交给 AI handle_dialog。
@@ -466,7 +480,8 @@ def hover(sess, args, session_dir):
     uid = str(args["uid"])
     vx, vy = _uid_quad(sess, uid)
     dispatch = _input_channel(sess)
-    humanize.move_mouse(sess.t, vx, vy, dispatch=dispatch)
+    humanize.move_mouse(sess.t, vx, vy, dispatch=dispatch,
+                        fire=_input_channel(sess, wait=False))
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
                           {"done": True, **({"navigated_to_url": nav} if nav else {})})
@@ -483,10 +498,11 @@ def drag(sess, args, session_dir):
         raise UnsupportedError("cross-frame drag is not supported: from_uid and to_uid must be in the same frame")
     # 坐标已换算主视口系:按下/拖动/抬起统一主 session 派发(浏览器 hit-test 路由)
     send = _input_channel(sess)
-    humanize.move_mouse(t, x1, y1, dispatch=send)
-    send("Input.dispatchMouseEvent", type="mousePressed", x=x1, y=y1, button="left", clickCount=1)
+    fire = _input_channel(sess, wait=False)
+    humanize.move_mouse(t, x1, y1, dispatch=send, fire=fire)
+    fire("Input.dispatchMouseEvent", type="mousePressed", x=x1, y=y1, button="left", clickCount=1)
     for px, py in humanize.trajectory(x1, y1, x2, y2)[1:-1]:
-        send("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py, button="left", buttons=1)
+        fire("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py, button="left", buttons=1)
         time.sleep(humanize._STEP_S)
     send("Input.dispatchMouseEvent", type="mouseReleased", x=x2, y=y2, button="left", clickCount=1)
     nav = _wait_after_action(sess)
@@ -512,7 +528,7 @@ def fill(sess, args, session_dir):
     cdp.call("DOM.focus", timeout=10, session_id=sid or None, backendNodeId=bnn)
     try:
         cx, cy = _uid_quad(sess, uid)
-        humanize.click_xy(t, cx, cy, dispatch=dispatch)
+        humanize.click_xy(t, cx, cy, dispatch=dispatch, fire=_input_channel(sess, wait=False))
     except Exception:
         pass  # 聚焦已由 DOM.focus 保证;点击仅为拟人(几何异常不阻断)
     # 置值经 DOM.resolveNode→callFunctionOn 在目标元素上执行(this=元素,iframe 内
@@ -568,7 +584,8 @@ def fill_form(sess, args, session_dir):
 
 def press_key(sess, args, session_dir):
     _check_dialog(sess)
-    humanize.press_key(sess.t, str(args["key"]))
+    humanize.press_key(sess.t, str(args["key"]),
+                       dispatch=_input_channel(sess), fire=_input_channel(sess, wait=False))
     nav = _wait_after_action(sess)
     return _with_snapshot(sess, args.get("includeSnapshot"),
                           {"pressed": True, **({"navigated_to_url": nav} if nav else {})})
@@ -576,7 +593,8 @@ def press_key(sess, args, session_dir):
 
 def type_text(sess, args, session_dir):
     _check_dialog(sess)
-    humanize.type_text(sess.t, str(args["text"]), args.get("submitKey"))
+    humanize.type_text(sess.t, str(args["text"]), args.get("submitKey"),
+                       dispatch=_input_channel(sess), fire=_input_channel(sess, wait=False))
     nav = _wait_after_action(sess)
     return {"typed": len(str(args["text"])),
             **({"navigated_to_url": nav} if nav else {})}
@@ -610,7 +628,8 @@ def upload_file(sess, args, session_dir):
     try:
         cdp_ev.call("Page.enable")  # 部分 Chromium 上 fileChooserOpened 派发要求 Page 域已启用
         cdp_ev.call("Page.setInterceptFileChooserDialog", enabled=True)
-        humanize.click_xy(sess.t, cx, cy)
+        humanize.click_xy(sess.t, cx, cy, dispatch=_input_channel(sess),
+                          fire=_input_channel(sess, wait=False))
         deadline = time.time() + 3
         chooser_bnn = None
         while time.time() < deadline and chooser_bnn is None:

@@ -78,12 +78,16 @@ def trajectory(x0, y0, x1, y1):
     return out
 
 
-def move_mouse(tab, x, y, dispatch=None):
+def move_mouse(tab, x, y, dispatch=None, fire=None):
     """从上次落点拟人移动到 (x, y)(PageHandler mousemove 分支语义):
     轨迹起点 = 上次真实落点(初始 (0,0),camoufox _lastTrackedPos 同款);零位移
     短路;中间点逐个派发 + 固定 10ms,视口外(含恰在边界)的点跳过;终点精确
-    派发。dispatch:Input 派发通道(主 session ws;坐标已换算主视口系)。"""
+    派发。dispatch:Input 派发通道(主 session ws;坐标已换算主视口系)。
+    fire:同通道的不等 ACK 派发器,轨迹点走它。逐点等 ACK 会把渲染主线程的忙
+    时段乘成整条命令的耗时(30 个点各等一次,页面一卡就是几十秒);CDP 在单条 ws
+    上保序,点击随后的阻塞调用返回到达即证明轨迹已按序入队。"""
     send = dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
+    tracer = fire or send
     last = getattr(tab, "_bu_last_mouse", (0.0, 0.0))
     if round(x) == round(last[0]) and round(y) == round(last[1]):
         tab._bu_last_mouse = (x, y)
@@ -91,9 +95,9 @@ def move_mouse(tab, x, y, dispatch=None):
     vw, vh = _viewport(send)
     for px, py in trajectory(last[0], last[1], x, y)[1:-1]:  # 跳过起点对与终点对
         if 0 <= px < vw and 0 <= py < vh:
-            send("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py)
+            tracer("Input.dispatchMouseEvent", type="mouseMoved", x=px, y=py)
             time.sleep(_STEP_S)
-    send("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+    tracer("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
     tab._bu_last_mouse = (x, y)
 
 
@@ -111,28 +115,36 @@ def _viewport(send):
     return (10 ** 6, 10 ** 6)
 
 
-def click_xy(tab, x, y, dbl=False, dispatch=None):
+def click_xy(tab, x, y, dbl=False, dispatch=None, fire=None):
     """move → 按下 → 抬起(camoufox:点击不经轨迹展开,move 段已人类化)。
-    按下/抬起间的小随机间隔见模块头偏离声明。"""
+    按下/抬起间的小随机间隔见模块头偏离声明。
+    按下/抬起与轨迹点同样不等 ACK:它们在同一条 ws 上保序,调用方随后的阻塞调用
+    (动作后等待/坐标查询)返回到达即证明点击已派发。等 ACK 会把渲染主线程的忙
+    时段(长任务、弹窗挂起)整段算进命令耗时。"""
     send = dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
-    move_mouse(tab, x, y, dispatch)
+    tracer = fire or send
+    move_mouse(tab, x, y, dispatch, fire)
     common = dict(x=x, y=y, button="left", clickCount=1)
-    send("Input.dispatchMouseEvent", type="mousePressed", **common)
+    tracer("Input.dispatchMouseEvent", type="mousePressed", **common)
     time.sleep(random.uniform(*_PRESS_S))
-    send("Input.dispatchMouseEvent", type="mouseReleased", **common)
+    tracer("Input.dispatchMouseEvent", type="mouseReleased", **common)
     if dbl:
-        send("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=2)
+        tracer("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=2)
         time.sleep(random.uniform(*_PRESS_S))
-        send("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=2)
+        tracer("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=2)
 
 
-def type_text(tab, text, submit_key=None):
+def type_text(tab, text, submit_key=None, dispatch=None, fire=None):
+    """逐字输入:每字符 keyDown+keyUp,字间间隔为拟人窗口(时间轴由 sleep 决定,
+    不由渲染主线程的忙闲决定——逐字等 ACK 在繁忙页面上会退化成每字数秒)。"""
+    send = dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
+    tracer = fire or send
     for ch in text:
-        tab.run_cdp("Input.dispatchKeyEvent", type="keyDown", text=ch, unmodifiedText=ch)
-        tab.run_cdp("Input.dispatchKeyEvent", type="keyUp", text=ch, unmodifiedText=ch)
+        tracer("Input.dispatchKeyEvent", type="keyDown", text=ch, unmodifiedText=ch)
+        tracer("Input.dispatchKeyEvent", type="keyUp", text=ch, unmodifiedText=ch)
         time.sleep(_gauss(0.055, 0.165))
     if submit_key:
-        press_key(tab, submit_key)
+        press_key(tab, submit_key, dispatch=dispatch, fire=fire)
 
 
 def _gauss(lo, hi):
@@ -212,17 +224,19 @@ def parse_key(key_input):
     return [result[-1], *result[:-1]]
 
 
-def press_key(tab, key):
+def press_key(tab, key, dispatch=None, fire=None):
     """Enter/Control+A 形式;修饰键按住→主键→释放。可打印字符走 keyDown(text)
     使其产生实际输入(对齐 puppeteer press 语义,rawKeyDown 不生成字符)。
-    中途抛错时 finally 逆序释放已按下的修饰键(上游 #2309),避免修饰键逻辑卡死。"""
+    中途抛错时 finally 逆序释放已按下的修饰键(上游 #2309),避免修饰键逻辑卡死。
+    dispatch/fire 语义同 type_text:按键流按序入队,不必逐次等 ACK。"""
+    tracer = fire or dispatch or (lambda m, **kw: tab.run_cdp(m, **kw))
     main, *mods = parse_key(key)
     modifiers = 0
     pressed = []
     try:
         for m in mods:
             modifiers |= {"Control": 2, "Alt": 1, "Shift": 8, "Meta": 4}[m]
-            tab.run_cdp("Input.dispatchKeyEvent", type="rawKeyDown",
+            tracer("Input.dispatchKeyEvent", type="rawKeyDown",
                         key=m, code=f"{m}Left", modifiers=modifiers, windowsVirtualKeyCode=_vk(m))
             pressed.append((m, modifiers))
         time.sleep(_gauss(0.03, 0.09))
@@ -235,10 +249,10 @@ def press_key(tab, key):
         if printable:
             down_kwargs["text"] = main
             down_kwargs["unmodifiedText"] = main
-        tab.run_cdp("Input.dispatchKeyEvent", **down_kwargs)
-        tab.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=main,
+        tracer("Input.dispatchKeyEvent", **down_kwargs)
+        tracer("Input.dispatchKeyEvent", type="keyUp", key=main,
                     code=code_field, windowsVirtualKeyCode=code, modifiers=modifiers)
     finally:
         for m, mods_bit in reversed(pressed):
-            tab.run_cdp("Input.dispatchKeyEvent", type="keyUp",
+            tracer("Input.dispatchKeyEvent", type="keyUp",
                         key=m, code=f"{m}Left", modifiers=mods_bit)

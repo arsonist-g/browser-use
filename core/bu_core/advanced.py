@@ -121,11 +121,12 @@ def screencast_collect(sess, args, session_dir):
 
 def click_at(sess, args, session_dir):
     from . import humanize
-    from .tools import _check_dialog, _wait_after_action, _with_snapshot
+    from .tools import _check_dialog, _input_channel, _wait_after_action, _with_snapshot
     _check_dialog(sess)
     x, y = float(args["x"]), float(args["y"])
     try:
-        humanize.click_xy(sess.t, x, y, dbl=bool(args.get("dblClick")))
+        humanize.click_xy(sess.t, x, y, dbl=bool(args.get("dblClick")),
+                          dispatch=_input_channel(sess), fire=_input_channel(sess, wait=False))
     except TimeoutError:
         pass  # 弹窗在按下/抬起间弹出:点击已发生,dialog 交给 AI(同 click)
     nav = _wait_after_action(sess)

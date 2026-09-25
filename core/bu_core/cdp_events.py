@@ -6,6 +6,7 @@
 """
 import json
 import os
+import select
 import threading
 import time
 import urllib.error
@@ -310,6 +311,15 @@ class CdpEvents:
         self.responses.clear()
         return self.connect(self.target_id)
 
+    def fire(self, method, session_id=None, **params):
+        """发送命令且不等 ACK(响应到达即丢):只用于"顺序即语义"的批量派发
+        (鼠标轨迹点、按下/抬起、逐字按键)。同一 ws 上 CDP 按序处理,后续阻塞调用的
+        返回即代表此前全部派发已入队并被执行——不必为每个点等一次渲染主线程回执,
+        那是把主线程的忙时段乘成整条命令的耗时。断线重连语义同 send。"""
+        mid = self.send(method, session_id=session_id, **params)
+        self._abandoned.add(mid)
+        return mid
+
     def send(self, method, session_id=None, **params):
         """发送命令,不等待响应(响应由 pump 收进 responses)。断线时重连重发一次。
         session_id:flatten 子 session(OOPIF)时作为消息顶层 sessionId 路由。"""
@@ -341,14 +351,41 @@ class CdpEvents:
             raise cdp_failure(method, r["error"])
         return r.get("result", {})
 
-    def pump(self, deadline=None):
-        """非阻塞读一帧:事件入 events,命令响应入 responses。
+    _POLL_S = 0.02   # 空转等待粒度:无帧可读时一次 pump 白等的上界(旧写法=socket 超时 ~250ms)
+
+    def drain(self, budget=0.0):
+        """把已到达的帧读空(最多等 budget 秒,0 = 纯非阻塞)。预检类调用
+        (_check_dialog)用它:只关心"此刻有没有已到达的弹窗事件",不该为一次预检
+        白等一个 recv 粒度。返回读到的帧数。"""
+        got = 0
+        end = time.monotonic() + budget
+        while True:
+            before = len(self.responses) + len(self.events)
+            self.pump(timeout=max(0.0, end - time.monotonic()))
+            if len(self.responses) + len(self.events) == before or not self.ws:
+                return got
+            got += 1
+
+    def pump(self, deadline=None, timeout=None):
+        """读一帧:事件入 events,命令响应入 responses。
         连接被浏览器侧断开时置空 ws(置灰),下次 send 触发重连。
         Target.attached/detachedFromTarget 在此登记/注销 OOPIF 子 session;
         javascriptDialogOpening/Closed 在此登记弹窗状态;
-        Page 域其余事件(生命周期类,无人消费)丢弃防队列膨胀。"""
+        Page 域其余事件(生命周期类,无人消费)丢弃防队列膨胀。
+
+        先用 select 按 timeout(缺省 _POLL_S)等可读、再交给 recv。旧写法直接
+        recv:有帧时它立即返回,但没有帧时会一直阻塞到 socket 超时——实测空闲一次
+        recv 等满 264ms,而弹窗预检与动作后探测的每一次 pump 都要付这笔空转。
+        改 select 20ms 粒度后,空转等待降到 ~30ms。recv 的 socket 超时只留给
+        "半帧已到、等剩余字节"(过小会撕裂帧)。timeout=0 为纯非阻塞。"""
         if not self.ws:
             return
+        try:
+            budget = self._POLL_S if timeout is None else max(0.0, timeout)
+            if not select.select([self.ws.sock], [], [], budget)[0]:
+                return
+        except Exception:
+            pass  # 取不到底层 socket 时退回原语义(直接 recv)
         try:
             raw = self.ws.recv()
         except websocket.WebSocketTimeoutException:
