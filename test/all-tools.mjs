@@ -15,6 +15,8 @@ const BASE = `http://127.0.0.1:${FIXTURE_PORT}`;
 const HEADED = process.argv.includes("--headed");
 // 无头启动已从 CLI 移除(反检测红线):测试进程经本环境变量显式放行,无头只作补充形态
 if (!HEADED) process.env.BU_DEV_ALLOW_HEADLESS = "1";
+// 日常浏览器自启在测试里必须关掉:否则 session.start 会去拉起用户真实的日常 Edge(真实副作用)
+process.env.BU_DEV_NO_DAILY_AUTOSTART = "1";
 
 const results = {};  // tool -> PASS/FAIL/SKIP(原因)
 function mark(tool, status, detail = "") { results[tool] = { status, detail }; console.log(`  ${status === "PASS" ? "✔" : status === "SKIP" ? "○" : "✘"} ${tool}${detail ? ` — ${detail.slice(0, 140)}` : ""}`); }

@@ -20,7 +20,7 @@ npm i -g @arsonist-g/browser-use
 browser-use doctor        # checks node >= 20, python 3.10+, DrissionPage core, Edge; --fix installs what is missing
 ```
 
-One-time setup: load the bridge extension into your daily Edge (`browser-use extension` prints the directory; `edge://extensions` → Developer mode → Load unpacked). While your daily browser is open, the extension feeds login cookies to new sessions automatically: no tokens, no popup dance.
+One-time setup: load the bridge extension into your daily Edge (`browser-use extension` prints the directory; `edge://extensions` → Developer mode → Load unpacked). While your daily browser is open, the extension feeds login cookies to new sessions automatically: no tokens, no popup dance. You do not have to remember to open it: when the extension is not reachable, `browser-use start` opens your daily browser itself and waits for the extension to reconnect (`browser-use daily-browser` runs just that step; `config set daily_browser_autostart false` turns the automatic part off).
 
 ## 30-second start
 

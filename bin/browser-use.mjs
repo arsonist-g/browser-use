@@ -131,7 +131,7 @@ async function main() {
   const argv = process.argv.slice(2);
   // 通用解析:--flag value / --boolFlag / 位置参数(工具参数各异,不再逐一声明)
   const BOOL_FLAGS = new Set(["includeSnapshot", "dblClick", "ignoreCache", "fullPage", "verbose",
-    "bringToFront", "fix", "dry-run", "force", "remove"]);
+    "bringToFront", "fix", "dry-run", "force", "remove", "no-launch"]);
   const values = {};   // flags
   const positionals = [];
   for (let i = 1; i < argv.length; i++) {
@@ -156,6 +156,7 @@ usage:
   browser-use stop --session=<id>
   browser-use sessions list [--state=<s>] | sessions clean
   browser-use status
+  browser-use daily-browser [ensure|status] [--no-launch] [--wait-ms=<ms>]   # 日常浏览器没开就拉起(桥扩展活在它里面)
   browser-use <tool> --session=<id> [位置参数] [flags]   # take_snapshot/click/fill/...
   browser-use config get [k] | set <k> <v> | list | reset [k]
   browser-use extension          # 打印桥扩展目录与配对 token
@@ -176,7 +177,7 @@ usage:
   if (command === "help") return out(helpOverviewText());
   if (values.help) {
     if (toolHelpText(command)) return out(toolHelpText(command));
-    const sessionCmds = new Set(["start", "stop", "sessions", "session.bare", "status", "config", "extension", "skill", "allow", "doctor"]);
+    const sessionCmds = new Set(["start", "stop", "sessions", "session.bare", "status", "config", "extension", "skill", "allow", "doctor", "daily-browser"]);
     if (sessionCmds.has(command)) return out(helpOverviewText());
     dieUsage(`未知工具: ${command}(browser-use help 列出全部工具)`);
   }
@@ -209,8 +210,9 @@ usage:
         const r = await rpc("session.start", { headless: DEV_HEADLESS, browser_exe: values["browser-exe"], extra_flags: extraFlags });
         if (jsonMode) return outJson(r);
         out(`session=${r.session_id}`);
+        if (r.daily_browser?.launched) out("daily_browser=launched(日常浏览器未打开,已自动拉起)");
         if (r.login_state === "injected") out("login=injected(登录态已注入)");
-        else out(`login=${r.login_state}\n提示: 未取得登录态。若任务需要登录:确认日常浏览器已打开、扩展已配对(popup 显示已连接);若不需要:browser-use session.bare --session=${r.session_id} 跳过。`);
+        else out(`login=${r.login_state}\n提示: 未取得登录态。任务需要登录时:确认日常浏览器已打开、桥扩展已加载(browser-use extension 打印目录,popup 显示已连接),或用 browser-use daily-browser 重试拉起;不需要登录时 browser-use session.bare --session=${r.session_id} 跳过。`);
         if (r.warning) out(`warning: ${r.warning}`);
         return;
       }
@@ -359,6 +361,36 @@ usage:
           }
         }
         if (results.some((r) => r.sites.some((s) => s.error))) process.exitCode = 2;
+        return;
+      }
+      case "daily-browser": {
+        // 日常浏览器自启(DEC-040):桥扩展活在用户的日常浏览器里,它没开 → 桥离线 → 登录态注入为空。
+        // 收尾以 BRIDGE_NOT_CONNECTED 的退出码表达"登录态还拿不到"(码即真原因,不靠正文猜)。
+        const sub = positionals[0] ?? "ensure";
+        const usage = "用法: browser-use daily-browser [ensure|status] [--no-launch] [--wait-ms=<毫秒>]";
+        if (sub !== "ensure" && sub !== "status") dieUsage(`未知 daily-browser 子命令: ${sub}(${usage})`);
+        let waitMs;
+        if (values["wait-ms"] !== undefined) {
+          waitMs = Number(values["wait-ms"]);
+          if (!Number.isFinite(waitMs) || waitMs < 0) {
+            dieUsage(`--wait-ms 需要非负毫秒数(例: --wait-ms=15000),收到 ${values["wait-ms"]}`);
+          }
+        }
+        await ensureDaemon();
+        const r = await rpc("daily.ensure", {
+          // status = 只看事实:不拉起(launch=false),也不等桥(wait_ms=0)
+          launch: sub === "ensure" && !("no-launch" in values),
+          wait_ms: sub === "status" ? 0 : waitMs,
+        });
+        if (jsonMode) outJson(r);
+        else {
+          out(`daily_browser=${Number(r.browser_windows) > 0 ? "open" : "closed"} `
+            + `windows=${r.browser_windows ?? "?"} processes=${r.browser_processes ?? "?"} `
+            + `bridge=${r.bridge_connected ? "connected" : "disconnected"} action=${r.action}`
+            + (r.waited_ms ? ` waited_ms=${r.waited_ms}` : ""));
+          if (r.hint) out(`hint: ${r.hint}`);
+        }
+        if (!r.bridge_connected) process.exitCode = ERROR_CODES.BRIDGE_NOT_CONNECTED.exit;
         return;
       }
       case "doctor": {

@@ -30,7 +30,7 @@ Imperative sentences are rules you must follow. Code blocks are command examples
 ## Login state
 
 - `start` copies the full cookie jar (including httpOnly) from the user's daily browser at session start. Logged-in sites work with no credential entry.
-- If injection succeeds, `start` prints `login=injected`. If the daily browser is closed or the bridge extension is not connected, it prints a login hint instead and still returns a session; decide then: ask the user to open the daily browser, or run `browser-use session.bare --session=<id>` if the task needs no login.
+- If injection succeeds, `start` prints `login=injected`. If the bridge extension is not connected, `start` first opens the daily browser itself (the extension lives there) and waits for it to reconnect, printing `daily_browser=launched(…)` when it did that. If the bridge is still down it prints a login hint instead and still returns a session; decide then: confirm the extension is loaded (`browser-use extension` prints its directory; `browser-use daily-browser` retries the whole step), or run `browser-use session.bare --session=<id>` if the task needs no login.
 - Multiple sessions share the same cookies, which behaves like a human opening several windows: most platforms treat this as one device, no forced logout.
 - Honest limits: a logout or password change inside a session also affects the daily browser's account (same as a human second window); platforms that rotate refresh tokens may kick one side; short-lived login cookies can go stale, in which case start a fresh session.
 
@@ -78,7 +78,7 @@ browser-use <tool> --session=<id> [required positionals] [--optional-flags]
 | PWA | get_os_app_state, install_pwa, launch_pwa, uninstall_pwa |
 | Extensions | install_extension, list_extensions, reload_extension, trigger_extension_action, uninstall_extension |
 
-Plus session commands: `start`, `stop`, `sessions list|clean`, `session.bare`, `status`, `config`, `extension`, `allow`, `doctor`.
+Plus session commands: `start`, `stop`, `sessions list|clean`, `session.bare`, `status`, `daily-browser`, `config`, `extension`, `allow`, `doctor`.
 
 The **Tool reference** section at the end of this file maps every tool to its parameters and command-specific notes; `browser-use help <tool>` prints the full per-parameter reference (types, accepted values, defaults) at runtime.
 
@@ -288,6 +288,7 @@ These four tools are the only ones that need the debugging pipe. In a port-only 
 | `sessions list` / `sessions clean` | `[--state=<s>]` | `clean` reaps non-live sessions and deletes their data entirely. |
 | `session.bare` | `--session=<id>` | Skips login-state injection. |
 | `status` | | Daemon, bridge, and session state. |
+| `daily-browser [status\|ensure]` | `--no-launch` `--wait-ms <ms>` | Guarantees the daily browser is open, since the bridge extension lives in it: `ensure` (default) launches it when it is closed and waits for the extension to reconnect, `status` only reports. `start` runs this automatically (`config set daily_browser_autostart false` turns it off). Exits 4 when the bridge is still disconnected. |
 | `config get/set/list/reset` | | |
 | `extension` | | Prints the bridge extension directory. |
 | `skill list/install/uninstall` | `--agent=<key>` `--all` `--force` `--dry-run` | Installs this skill into coding agents. |
