@@ -20,7 +20,7 @@ npm i -g @arsonist-g/browser-use
 browser-use doctor        # 检查 node >= 20、python 3.10+、DrissionPage 内核、Edge;--fix 自动补齐
 ```
 
-一次性配置:把桥扩展装入日常 Edge(`browser-use extension` 打印目录;`edge://extensions` → 开发者模式 → 加载解压缩的扩展)。日常浏览器处于打开状态时,扩展自动向新会话供给登录 cookie:无需 token,无需反复点 popup。日常浏览器没开也不需要你记着去开:桥不可达时 `browser-use start` 会自己把日常浏览器拉起来并等扩展重连(`browser-use daily-browser` 可单独跑这一步;`config set daily_browser_autostart false` 关掉自动那半)。
+一次性配置:从 [GitHub Releases](https://github.com/arsonist-g/browser-use/releases/latest) 下载扩展压缩包并解压,再把对应目录装入日常 Edge;npm 包内也包含同一份扩展(`browser-use extension` 打印目录;`edge://extensions` → 开发者模式 → 加载解压缩的扩展)。日常浏览器处于打开状态时,扩展自动向新会话供给登录 cookie:无需 token,无需反复点 popup。日常浏览器没开也不需要你记着去开:桥不可达时 `browser-use start` 会自己把日常浏览器拉起来并等扩展重连(`browser-use daily-browser` 可单独跑这一步;`config set daily_browser_autostart false` 关掉自动那半)。
 
 ## 30 秒上手
 
