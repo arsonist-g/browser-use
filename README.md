@@ -49,12 +49,12 @@ Supported agents and their skill directories (each verified against the vendor's
 | Agent | Directory | Key |
 |---|---|---|
 | Claude Code | `~/.claude/skills/browser-use/` | `claude-code` |
-| Codex CLI | `~/.agents/skills/browser-use/` | `codex` |
+| Codex CLI | `~/.codex/skills/browser-use/` | `codex` |
 | Cursor | `~/.cursor/skills/browser-use/` | `cursor` |
 | Gemini CLI | `~/.gemini/skills/browser-use/` | `gemini-cli` |
 | Windsurf | `~/.codeium/windsurf/skills/browser-use/` | `windsurf` |
 
-Codex, Cursor, Gemini CLI, and Windsurf also read the cross-vendor `~/.agents/skills/` directory; the installer writes each agent's own directory so every one can be installed and removed independently. Restart the agent after installing so it picks up the skill.
+The installer writes each agent's own directory so every one can be installed and removed independently. Codex uses its dedicated `~/.codex/skills/` directory, which remains visible when Codex runs through WSL. Restart the agent after installing so it picks up the skill.
 
 ## Skip per-command approval
 

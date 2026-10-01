@@ -49,12 +49,12 @@ browser-use skill install --all [--dry-run]       # 全部支持的 agent;--dry-
 | Agent | 目录 | key |
 |---|---|---|
 | Claude Code | `~/.claude/skills/browser-use/` | `claude-code` |
-| Codex CLI | `~/.agents/skills/browser-use/` | `codex` |
+| Codex CLI | `~/.codex/skills/browser-use/` | `codex` |
 | Cursor | `~/.cursor/skills/browser-use/` | `cursor` |
 | Gemini CLI | `~/.gemini/skills/browser-use/` | `gemini-cli` |
 | Windsurf | `~/.codeium/windsurf/skills/browser-use/` | `windsurf` |
 
-Codex、Cursor、Gemini CLI、Windsurf 同时也读取跨厂商目录 `~/.agents/skills/`;安装器按各家专属目录写入,使每个 agent 可独立安装与卸载。安装后重启 agent 使 skill 生效。
+安装器按各家专属目录写入,使每个 agent 可独立安装与卸载。Codex 使用专用 `~/.codex/skills/`,在 `runCodexInWindowsSubsystemForLinux=true` 时也能被 Codex 正常映射。安装后重启 agent 使 skill 生效。
 
 ## 免逐次审批(命令放行)
 

@@ -36,8 +36,11 @@ test("AGENTS: key 唯一且 dir 为安全的 home 相对路径", () => {
 
 test("skillTargetDir: home + agent 目录 + skill 名拼接", () => {
   const home = tmpHome();
-  const d = skillTargetDir("claude-code", home);
-  assert.equal(d, path.join(home, ".claude", "skills", "browser-use"));
+  assert.equal(
+    skillTargetDir("claude-code", home),
+    path.join(home, ".claude", "skills", "browser-use"),
+  );
+  assert.equal(skillTargetDir("codex", home), path.join(home, ".codex", "skills", "browser-use"));
   assert.throws(() => skillTargetDir("no-such-agent", home), /unknown agent/);
 });
 
