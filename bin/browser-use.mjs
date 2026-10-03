@@ -285,6 +285,15 @@ usage:
         if (r.daily_browser?.launched) out("daily_browser=launched(日常浏览器未打开,已自动拉起)");
         if (r.login_state === "injected") out("login=injected(登录态已注入)");
         else out(`login=${r.login_state}\n提示: 未取得登录态。任务需要登录时:确认日常浏览器已打开、桥扩展已加载(browser-use extension 打印目录,popup 显示已连接),或用 browser-use daily-browser 重试拉起;不需要登录时 browser-use session.bare --session=${r.session_id} 跳过。`);
+        if (r.web_storage?.injected) {
+          const w = r.web_storage;
+          out(`storage=seeded(localStorage/sessionStorage 已种入 ${w.origins} 个源、${w.entries} 个键;`
+            + "只含日常浏览器当前打开的标签页"
+            + (w.truncated ? ";有源超出体积上限,部分键未搬运" : "") + ")");
+        } else if (r.web_storage && r.web_storage.reported === false) {
+          // 扩展没回存储这一问 = 它还是 0.1.x;这不是故障,但登录态只在 localStorage 的站会一直登不上
+          out("storage=skipped(桥扩展还在 0.1.x,不搬 Web 存储;把扩展更新到 0.2.0 并在 edge://extensions 重新加载后,重开一个会话即可)");
+        }
         if (r.warning) out(`warning: ${r.warning}`);
         return;
       }

@@ -2,6 +2,7 @@
 """会话内 DP 生命周期与浏览器实例(DEC-001:默认浏览器 exe、有头、默认指纹)。
 红线(CONSTRAINT-001):不启用 Runtime.enable;不做 UA/平台/语言覆盖。
 """
+import json
 import os
 import time
 
@@ -50,6 +51,46 @@ def install_console_hook(tab):
         pass
 
 
+# Web 存储种子:一部分站的登录态(token/uid)只落在 localStorage/sessionStorage,光有 cookie
+# 打开仍是未登录。桥扩展能把它们从日常浏览器读出来,但要"赶在站点脚本之前"落进目标源,只有
+# addScriptToEvaluateOnNewDocument 这条路(导航后再写 = 站点早已判定未登录)。
+# 两条约束:① 只种主框架 —— 第三方 iframe 拿到的是分区隔离的另一份存储,种进去是错的源;
+# ② 只填不覆盖 —— 会话内站点自己写的值优先,种子只在键缺失时落一次(同页重复导航也幂等)。
+_STORAGE_SEED_TEMPLATE = """(() => {
+  try {
+    if (window.top !== window.self) return;
+    const db = %s;
+    const rec = db[location.origin];
+    if (!rec) return;
+    const fill = (store, data) => {
+      if (!data) return;
+      for (const k in data) {
+        try { if (store.getItem(k) === null) store.setItem(k, data[k]); } catch (e) {}
+      }
+    };
+    try { fill(window.localStorage, rec.l); } catch (e) {}
+    try { fill(window.sessionStorage, rec.s); } catch (e) {}
+  } catch (e) {}
+})();"""
+
+
+def build_storage_seed_js(db):
+    """{origin: {"l": {...}, "s": {...}}} → 种入脚本;无条目返回 None(不装空 hook)。"""
+    if not db:
+        return None
+    return _STORAGE_SEED_TEMPLATE % json.dumps(db, ensure_ascii=True, separators=(",", ":"))
+
+
+def install_storage_seed(tab, js):
+    """对新 tab 注入 Web 存储种子(每个 Page target 独立;js 为空则什么都不做)。"""
+    if not js:
+        return
+    try:
+        tab.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=js)
+    except Exception:
+        pass
+
+
 # 浏览器内建页(下载中心/欢迎页/设置等)是浏览器 UI,不是任务页:页面级工具(快照/网络/
 # 滚动)落在上面只会误导 AI。实测:点击触发的下载会让 Edge 前置 edge://downloads-hub/,
 # 且 Target.closeTarget 与 HTTP /json/close 都关不掉它(CHROMIUM 接受请求,页面仍在)。
@@ -79,6 +120,8 @@ class BrowserSession:
         self.browser = None
         self.tab = None
         self.net_recorder = None
+        # Web 存储种入脚本(由 storage.inject 装入);None = 本会话没有可种的数据
+        self.storage_seed_js = None
         self._last_active_tab_id = None
         self._tab_cache = {}
         self._known_tab_ids = set()
@@ -153,7 +196,7 @@ class BrowserSession:
         # 弹窗不自动处理(对齐 cdt:dialog 挂起阻塞页面 JS,由 handle_dialog 工具
         # 显式 accept/dismiss;自动 accept 会让 handle_dialog 永远无弹窗可处理)
         # console 捕获 hook(每 Page target 注入一次,导航后自动重挂)
-        install_console_hook(self.tab)
+        self._install_hooks(self.tab)
         # 下载行为对齐上游(puppeteer/CDT 启动即 allow):headless 新版默认 deny 下载,
         # 点击 a[download] 会静默丢弃(无网络请求);落会话 downloads 目录(stop 全删口径)
         if self.session_dir:
@@ -200,8 +243,40 @@ class BrowserSession:
                     tab.listen.start()
             except Exception:
                 pass
-        install_console_hook(tab)
+        self._install_hooks(tab)
         return tab
+
+    def _install_hooks(self, tab):
+        """给一个 tab 装上页内 hook(console 捕获 + Web 存储种子)。两者都幂等,
+        重复安装不会改变语义,所以新 tab 走这里、已存在的 tab 重装也走这里。"""
+        install_console_hook(tab)
+        install_storage_seed(tab, self.storage_seed_js)
+
+    def inject_storage(self, origins):
+        """把桥读到的 Web 存储种进会话:装到现有全部 tab,并留给此后新建的 tab。
+
+        种子只在文档导航到对应源时生效(init script 先于该文档的所有脚本),所以必须在会话把
+        页面导航到目标站之前完成 —— daemon 在 session.start 的登录态注入里就调用它。
+        """
+        db = {}
+        for rec in origins or []:
+            origin = rec.get("origin") if isinstance(rec, dict) else None
+            if not origin:
+                continue
+            entry = {}
+            for key, field in (("l", "local"), ("s", "session")):
+                bucket = rec.get(field)
+                if isinstance(bucket, dict) and bucket:
+                    entry[key] = {str(k): str(v) for k, v in bucket.items()}
+            if entry:
+                db[str(origin)] = entry
+        self.storage_seed_js = build_storage_seed_js(db)
+        if self.storage_seed_js is None:
+            return {"origins": 0, "entries": 0, "bytes": 0}
+        for tab in self.browser.get_tabs():
+            self._install_hooks(tab)
+        entries = sum(len(bucket) for rec in db.values() for bucket in rec.values())
+        return {"origins": len(db), "entries": entries, "bytes": len(self.storage_seed_js)}
 
     def _tab_index(self, tabs, tid):
         for i, tab in enumerate(tabs):

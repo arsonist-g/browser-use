@@ -16,7 +16,7 @@ async function refresh() {
     const r = await fetch("http://127.0.0.1:17981/status", { cache: "no-store" });
     const s = await r.json();
     document.getElementById("daemonV").textContent = s.version;
-    if (s.bridge?.connected) { setLight("ok", "已连接 daemon · cookie 通道就绪"); return; }
+    if (s.bridge?.connected) { setLight("ok", "已连接 daemon · 登录态通道就绪(cookie + Web 存储)"); return; }
   } catch { /* daemon 不在线 */ }
   const { uiState = "", uiDetail = "" } = await chrome.storage.local.get(["uiState", "uiDetail"]);
   if (uiState === "connected") setLight("warn", "扩展已连 daemon(守护进程状态未知)");

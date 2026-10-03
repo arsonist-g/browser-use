@@ -1,11 +1,11 @@
 ---
 name: browser-use
-description: Automate login-required or anti-bot-protected sites from the shell via the browser-use CLI. It drives a real headed Edge on this machine, inheriting the user's daily-browser login cookies through session-scoped injection, with no fingerprint overrides. Use it for multi-step web workflows (navigate, snapshot, click, fill), page inspection (screenshots, console, network, performance traces), and interaction on sites where ordinary automation gets detected.
+description: Automate login-required or anti-bot-protected sites from the shell via the browser-use CLI. It drives a real headed Edge on this machine, inheriting the user's daily-browser login state (cookies and web storage) through session-scoped injection, with no fingerprint overrides. Use it for multi-step web workflows (navigate, snapshot, click, fill), page inspection (screenshots, console, network, performance traces), and interaction on sites where ordinary automation gets detected.
 ---
 
 # browser-use
 
-`browser-use` automates a real browser from the shell. It launches the machine's own Edge (headed, default fingerprint), injects the login cookies of the user's daily browser into an isolated one-off profile at session start, and drives the page through simple CLI commands covering interaction, navigation, inspection, console, network, performance, memory, and more. Its core avoids the protocol-level signals that anti-bot systems detect, so it keeps working on sites where ordinary automation trips detection.
+`browser-use` automates a real browser from the shell. It launches the machine's own Edge (headed, default fingerprint), injects the login state of the user's daily browser (cookies and the web storage of the sites it has open) into an isolated one-off profile at session start, and drives the page through simple CLI commands covering interaction, navigation, inspection, console, network, performance, memory, and more. Its core avoids the protocol-level signals that anti-bot systems detect, so it keeps working on sites where ordinary automation trips detection.
 
 ## Output boundary
 
@@ -29,10 +29,10 @@ Imperative sentences are rules you must follow. Code blocks are command examples
 
 ## Login state
 
-- `start` copies the full cookie jar (including httpOnly) from the user's daily browser at session start. Logged-in sites work with no credential entry.
-- If injection succeeds, `start` prints `login=injected`. If the bridge extension is not connected, `start` first opens the daily browser itself (the extension lives there) and waits for it to reconnect, printing `daily_browser=launched(…)` when it did that. If the bridge is still down it prints a login hint instead and still returns a session; decide then: confirm the extension is loaded (`browser-use extension` prints its directory; `browser-use daily-browser` retries the whole step), or run `browser-use session.bare --session=<id>` if the task needs no login.
+- `start` copies login state from the user's daily browser at session start: the full cookie jar (including httpOnly), plus the `localStorage` / `sessionStorage` of the sites open in that browser right now. Logged-in sites work with no credential entry.
+- If injection succeeds, `start` prints `login=injected`, and `storage=seeded(N origins, M keys)` when web storage came along too. If the bridge extension is not connected, `start` first opens the daily browser itself (the extension lives there) and waits for it to reconnect, printing `daily_browser=launched(…)` when it did that. If the bridge is still down it prints a login hint instead and still returns a session; decide then: confirm the extension is loaded (`browser-use extension` prints its directory; `browser-use daily-browser` retries the whole step), or run `browser-use session.bare --session=<id>` if the task needs no login.
 - Multiple sessions share the same cookies, which behaves like a human opening several windows: most platforms treat this as one device, no forced logout.
-- Honest limits: a logout or password change inside a session also affects the daily browser's account (same as a human second window); platforms that rotate refresh tokens may kick one side; short-lived login cookies can go stale, in which case start a fresh session.
+- Honest limits: a logout or password change inside a session also affects the daily browser's account (same as a human second window); platforms that rotate refresh tokens may kick one side; short-lived login cookies can go stale, in which case start a fresh session. Web storage only covers origins the daily browser has a tab open for at `start` (an extension can read an origin's storage only through a page on that origin) — a logged-in site with no open tab contributes cookies only, so open it once and start a new session. Sites that keep the session in IndexedDB are not covered.
 
 ## AI workflow
 

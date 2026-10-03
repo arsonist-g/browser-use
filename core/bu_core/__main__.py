@@ -64,6 +64,8 @@ def main():
             cookies = payload.get("cookies", [])
             sess.browser.set.cookies(cookies)
             return {"injected": len(cookies)}
+        if op == "storage.inject":
+            return sess.inject_storage(payload.get("origins", []))
         if op == "tool.call":
             tool = payload["tool"]
             fn = getattr(T, tool, None)

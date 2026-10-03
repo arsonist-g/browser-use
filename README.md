@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README-ZH.md)
 
-AI browser automation that stays under anti-bot radar. `browser-use` drives the machine's own Edge (headed, default fingerprint), inherits your daily browser's login cookies into each session, and exposes the full chrome-devtools-mcp v1.8.0 tool surface (57 tools) through a simple CLI. Its DrissionPage core avoids the protocol-level signals that anti-bot systems detect, so it keeps working where ordinary automation trips detection.
+AI browser automation that stays under anti-bot radar. `browser-use` drives the machine's own Edge (headed, default fingerprint), inherits your daily browser's login state — cookies plus web storage (`localStorage` / `sessionStorage`) — into each session, and exposes the full chrome-devtools-mcp v1.8.0 tool surface (57 tools) through a simple CLI. Its DrissionPage core avoids the protocol-level signals that anti-bot systems detect, so it keeps working where ordinary automation trips detection.
 
 ## Why
 
@@ -20,19 +20,19 @@ npm i -g @arsonist-g/browser-use
 browser-use doctor        # checks node >= 20, python 3.10+, DrissionPage core, Edge; --fix installs what is missing
 ```
 
-One-time setup: download the extension zip from [GitHub Releases](https://github.com/arsonist-g/browser-use/releases/latest), unzip it, and load the folder into your daily Edge; the npm package also bundles the same extension (`browser-use extension` prints the directory; `edge://extensions` → Developer mode → Load unpacked). While your daily browser is open, the extension feeds login cookies to new sessions automatically: no tokens, no popup dance. You do not have to remember to open it: when the extension is not reachable, `browser-use start` opens your daily browser itself and waits for the extension to reconnect (`browser-use daily-browser` runs just that step; `config set daily_browser_autostart false` turns the automatic part off).
+One-time setup: download the extension zip from [GitHub Releases](https://github.com/arsonist-g/browser-use/releases/latest), unzip it, and load the folder into your daily Edge; the npm package also bundles the same extension (`browser-use extension` prints the directory; `edge://extensions` → Developer mode → Load unpacked). While your daily browser is open, the extension feeds login state to new sessions automatically: no tokens, no popup dance. That state has two parts — the cookie jar, and the `localStorage` / `sessionStorage` of the sites you have open right now, which is where a fair number of sites keep their session token; both are seeded into the session before the target page's own scripts run. **Already running an older extension? Reload it** (`edge://extensions` → reload the unpacked folder) so it carries the storage half too. You do not have to remember to open the daily browser: when the extension is not reachable, `browser-use start` opens it itself and waits for the extension to reconnect (`browser-use daily-browser` runs just that step; `config set daily_browser_autostart false` turns the automatic part off).
 
 ## 30-second start
 
 ```sh
-browser-use start                          # prints session=<id>; login=injected when cookies arrived
+browser-use start                          # prints session=<id>; login=injected / storage=seeded(…) when login state arrived
 browser-use take_snapshot --session=<id>   # text tree of the page, elements carry uid=...
 browser-use click --session=<id> "1_5"     # act by uid
 browser-use fill --session=<id> "3_2" "hello"
 browser-use stop --session=<id>            # closes Edge, deletes the one-off profile
 ```
 
-Each session is an isolated Edge instance with a disposable profile; `--session=<id>` routes every command, so concurrent AI windows never share a browser. Cookies are read from your daily browser at `start`, never written back to it. Page-scoped tools follow the browser's active tab, including tabs opened by a click and tabs the user switches to manually. `select_page` brings the chosen page to the browser foreground and routes future calls there; a later active-tab change takes precedence.
+Each session is an isolated Edge instance with a disposable profile; `--session=<id>` routes every command, so concurrent AI windows never share a browser. Login state (cookies and web storage) is read from your daily browser at `start`, never written back to it. Page-scoped tools follow the browser's active tab, including tabs opened by a click and tabs the user switches to manually. `select_page` brings the chosen page to the browser foreground and routes future calls there; a later active-tab change takes precedence.
 
 ## Install as an agent skill
 
@@ -98,6 +98,7 @@ Honest list, by design:
 - **Snapshots cover the main frame.** Same-frame iframe content is not stitched in yet.
 - **Screencast emits PNG frame sequences** (video encoding is future work).
 - **Short-lived login cookies can go stale** mid-day; starting a fresh session re-reads them.
+- **Web storage is copied from the tabs your daily browser has open at `start`.** An extension can only read an origin's `localStorage` through a page loaded on that origin, so a site you are logged into but currently have no tab open for contributes cookies but no storage — open it once and start a new session. Very large stores are capped (per origin 1 MB, 4 MB total); when a cap bites, `start` says so rather than dropping entries silently. IndexedDB is not carried over at all.
 - **A logout or password change inside a session affects your daily browser's account** (same as a human second window). Platforms that rotate refresh tokens may kick one side.
 - The daemon, bridge, and sessions bind to `127.0.0.1` only.
 

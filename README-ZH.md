@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README-ZH.md)
 
-不被反爬雷达发现的 AI 浏览器自动化。`browser-use` 驱动本机自己的 Edge(有头、默认指纹),把日常浏览器的登录 cookie 继承进每个会话,并以简单 CLI 暴露 chrome-devtools-mcp v1.8.0 的完整工具面(57 工具)。其 DrissionPage 内核避开反爬系统能检测的协议级信号,因此在普通自动化会被检测的站点上仍可工作。
+不被反爬雷达发现的 AI 浏览器自动化。`browser-use` 驱动本机自己的 Edge(有头、默认指纹),把日常浏览器的登录态——cookie 加页内 Web 存储(`localStorage` / `sessionStorage`)——继承进每个会话,并以简单 CLI 暴露 chrome-devtools-mcp v1.8.0 的完整工具面(57 工具)。其 DrissionPage 内核避开反爬系统能检测的协议级信号,因此在普通自动化会被检测的站点上仍可工作。
 
 ## 为什么做这个
 
@@ -20,19 +20,19 @@ npm i -g @arsonist-g/browser-use
 browser-use doctor        # 检查 node >= 20、python 3.10+、DrissionPage 内核、Edge;--fix 自动补齐
 ```
 
-一次性配置:从 [GitHub Releases](https://github.com/arsonist-g/browser-use/releases/latest) 下载扩展压缩包并解压,再把对应目录装入日常 Edge;npm 包内也包含同一份扩展(`browser-use extension` 打印目录;`edge://extensions` → 开发者模式 → 加载解压缩的扩展)。日常浏览器处于打开状态时,扩展自动向新会话供给登录 cookie:无需 token,无需反复点 popup。日常浏览器没开也不需要你记着去开:桥不可达时 `browser-use start` 会自己把日常浏览器拉起来并等扩展重连(`browser-use daily-browser` 可单独跑这一步;`config set daily_browser_autostart false` 关掉自动那半)。
+一次性配置:从 [GitHub Releases](https://github.com/arsonist-g/browser-use/releases/latest) 下载扩展压缩包并解压,再把对应目录装入日常 Edge;npm 包内也包含同一份扩展(`browser-use extension` 打印目录;`edge://extensions` → 开发者模式 → 加载解压缩的扩展)。日常浏览器处于打开状态时,扩展自动向新会话供给登录态:无需 token,无需反复点 popup。登录态含两部分——cookie 罐,以及你**当前打开着**的那些站的 `localStorage` / `sessionStorage`(相当一部分站把会话 token 放在这里);两者都在目标页自己的脚本执行之前种进会话。**已经装着旧扩展的话要重新加载一次**(`edge://extensions` → 重新加载该目录),它才有存储那半。日常浏览器没开也不需要你记着去开:桥不可达时 `browser-use start` 会自己把日常浏览器拉起来并等扩展重连(`browser-use daily-browser` 可单独跑这一步;`config set daily_browser_autostart false` 关掉自动那半)。
 
 ## 30 秒上手
 
 ```sh
-browser-use start                          # 打印 session=<id>;cookie 注入成功显示 login=injected
+browser-use start                          # 打印 session=<id>;登录态到手显示 login=injected / storage=seeded(…)
 browser-use take_snapshot --session=<id>   # 页面文本树,元素带 uid=...
 browser-use click --session=<id> "1_5"     # 按 uid 操作
 browser-use fill --session=<id> "3_2" "hello"
 browser-use stop --session=<id>            # 关闭 Edge,删除一次性 profile
 ```
 
-每个会话是带一次性 profile 的独立 Edge 实例;`--session=<id>` 路由每条命令,并发的 AI 窗口永不共享浏览器。cookie 在 `start` 时从日常浏览器读取,永不回写。页面级工具跟随浏览器活动标签页:点击打开的新前台标签页和用户手工切换的标签页都会生效。`select_page` 会把所选页真正切到浏览器前台并路由后续调用;此后若活动标签页再变化,以新活动页为准。
+每个会话是带一次性 profile 的独立 Edge 实例;`--session=<id>` 路由每条命令,并发的 AI 窗口永不共享浏览器。登录态(cookie 与 Web 存储)在 `start` 时从日常浏览器读取,永不回写。页面级工具跟随浏览器活动标签页:点击打开的新前台标签页和用户手工切换的标签页都会生效。`select_page` 会把所选页真正切到浏览器前台并路由后续调用;此后若活动标签页再变化,以新活动页为准。
 
 ## 安装为 agent skill
 
@@ -98,6 +98,7 @@ browser-use 是 [cdt](https://www.npmjs.com/package/@arsonist-g/cdt) 的后继�
 - **快照覆盖主 frame。** 同级 iframe 内容尚未拼接。
 - **录屏输出 PNG 帧序列**(视频编码是后续工作)。
 - **短时效登录 cookie 会过期**;重开一个会话即重新读取。
+- **Web 存储只搬 `start` 那一刻日常浏览器开着标签页的站点。** 扩展只能通过"该源上已加载的页面"读它的 `localStorage`,所以你登录着、但当前没有标签页打开的站只有 cookie、没有存储——把它开一次再重开会话即可。体积有上限(单源 1 MB、总量 4 MB),触顶时 `start` 会明说,而不是静默少搬键。IndexedDB 完全不在搬运范围内。
 - **会话内的登出/改密会作用于日常浏览器的同账号**(与人类开第二个窗口一致)。旋转 refresh token 的平台可能互踢一方。
 - daemon、桥、会话仅绑定 `127.0.0.1`。
 

@@ -4,6 +4,7 @@
 // 前置: 桥扩展已装且日常浏览器打开(login 断言在桥离线时自动 SKIP)
 // 退出码: 0 = 全过;1 = 有 fail(fail 明细列在汇总)
 import { spawn, execFileSync, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import path from "node:path";
 import os from "node:os";
 import url from "node:url";
@@ -743,6 +744,111 @@ async function main() {
   // ---- 14. port-only 会话:降级态的通道契约 ----
   console.log("\n[14] port-only 会话通道");
   await portOnlySection();
+
+  // ---- 15. Web 存储搬运:localStorage/sessionStorage 种入 ----
+  console.log("\n[15] Web 存储搬运");
+  await webStorageSection();
+}
+
+// 一部分站的登录态不在 cookie 里,只在 localStorage/sessionStorage;桥把日常浏览器读到的值
+// 随 cookie 同一次往返捎回,daemon 交给 core 做 init script 种入。
+// 这一节用隔离 home + 扮演扩展的假桥走通 daemon → core → 浏览器整条链(真扩展的采集逻辑
+// 由 test/unit/extension-bridge.test.mjs 覆盖;这里要证的是"种子先于站点脚本落下")。
+async function webStorageSection() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bu-webstorage-home-"));
+  const daemonPort = 27991;
+  const bridgePort = 27992;
+  const env = { ...process.env, BROWSER_USE_HOME: home, BU_DAEMON_PORT: String(daemonPort) };
+  const run = (args, timeoutMs = 120000) => spawnSync(process.execPath, [CLI, ...args],
+    { encoding: "utf8", timeout: timeoutMs, env });
+  // 假桥要在会话启动期间应答 daemon,所以这一步起必须异步:spawnSync 会把事件循环钉住,
+  // WS 消息进不来也回不去,daemon 只会等到 BRIDGE_TIMEOUT(这条曾经真的把本节测成红的)。
+  const runAsync = (args, timeoutMs = 120000) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI, ...args],
+      { env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* */ } }, timeoutMs);
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.on("close", (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+  });
+  let stSession = null;
+  let liveBrowser = false;
+  let bridge = null;
+  try {
+    fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({
+      port_range: [18570, 18620], daemon_http_port: daemonPort, bridge_ws_port: bridgePort,
+      daily_browser_autostart: false,
+    }));
+    const st = run(["status", "--output-format=json"]);
+    ok("web-storage daemon 起在隔离 home", st.status === 0, (st.stderr || "").slice(0, 160));
+
+    // 假桥 = 扩展的 daemon 侧那一半:回 cookie + storage(采集本身不在这里测)
+    const asked = [];
+    bridge = new WebSocket(`ws://127.0.0.1:${bridgePort}/?proto=1`);
+    bridge.on("message", (raw) => {
+      const m = JSON.parse(raw.toString());
+      if (m.type !== "getCookies") return;
+      asked.push(m);
+      bridge.send(JSON.stringify({
+        type: "cookies", reqId: m.reqId, data: [],
+        storage: [{ origin: BASE, local: { bu_e2e_token: "bu-e2e-seed-1" },
+          session: { bu_e2e_sid: "bu-e2e-session-1" } }],
+        storageStats: { tabs: 1, read: 1, origins: 1, bytes: 64, truncated: false, errors: [] },
+      }));
+    });
+    await once(bridge, "open");
+
+    const started = await runAsync(["start", "--output-format=json"]);
+    let r = {};
+    try { r = JSON.parse(started.stdout); } catch { /* 断言在下一行给出 */ }
+    stSession = r.session_id ?? null;
+    liveBrowser = !!stSession;
+    ok("会话启动时向桥要了 Web 存储(wantStorage)",
+      asked.some((m) => m.wantStorage === true),
+      `asked=${JSON.stringify(asked)} status=${started.status} err=${(started.stderr || "").slice(0, 160)}`);
+    ok("start 自报 Web 存储种入(cookie 为空也照常注入)",
+      r.web_storage?.injected === true && r.web_storage.origins === 1 && r.web_storage.reported === true,
+      `web_storage=${JSON.stringify(r.web_storage)}`);
+    if (stSession) {
+      await runAsync(["navigate_page", `${BASE}/storage-seed`, "--session", stSession]);
+      const snap = await runAsync(["take_snapshot", "--session", stSession]);
+      ok("种子先于站点脚本落下(文档开始读到的就是日常浏览器的值)",
+        /at-load token=bu-e2e-seed-1 sid=bu-e2e-session-1/.test(snap.stdout),
+        (snap.stdout.split("\n").find((l) => l.includes("storage-seed")) ?? snap.stdout).slice(0, 200));
+      // 会话内站点自己写的值不得被种子覆盖回去(种子只填缺失的键)
+      await runAsync(["navigate_page", `${BASE}/storage-write`, "--session", stSession]);
+      await runAsync(["navigate_page", `${BASE}/storage-seed`, "--session", stSession]);
+      const snap2 = await runAsync(["take_snapshot", "--session", stSession]);
+      ok("种子只填不覆盖:会话内站点写入的值仍在",
+        /now token=page-written/.test(snap2.stdout),
+        (snap2.stdout.split("\n").find((l) => l.includes("storage-seed")) ?? snap2.stdout).slice(0, 200));
+      const stopped = run(["stop", "--session", stSession]);
+      ok("web-storage 会话可正常 stop", stopped.stdout.includes("state=cleaned"), stopped.stdout.slice(0, 120));
+      stSession = null;
+    }
+  } finally {
+    try { bridge?.close(); } catch { /* */ }
+    if (stSession) { try { run(["stop", "--session", stSession], 30000); } catch { /* */ } }
+    try {
+      const pid = Number(fs.readFileSync(path.join(home, "daemon.pid"), "utf8").trim());
+      if (pid) process.kill(pid);
+    } catch { /* 未起或已退出 */ }
+    if (liveBrowser && fs.existsSync(path.join(home, "profiles"))) {
+      const escaped = home.replace(/'/g, "''");
+      spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+        `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object ` +
+        `{ $_.CommandLine -like '*${escaped}*' } | ForEach-Object ` +
+        `{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
+      { stdio: "ignore", windowsHide: true });
+    }
+    await new Promise((r) => setTimeout(r, 800));
+    for (let i = 0; i < 3; i++) {
+      try { fs.rmSync(home, { recursive: true, force: true }); break; }
+      catch { await new Promise((r) => setTimeout(r, 500)); }
+    }
+  }
 }
 
 // port-only(无 pipe)形态只在异常环境自然出现(浏览器自我重启丢失 fd 3/4),

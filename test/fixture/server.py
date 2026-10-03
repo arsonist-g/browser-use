@@ -24,6 +24,8 @@ GET /spa         → SPA 路由页(pushState + 异步 fetch)
 GET /beacon      → sendBeacon 落点
 GET /set-cookie  → Set-Cookie: bu_e2e=<ts>; Path=/(会话实例种 cookie 用)
 GET /echo-cookie → 响应体 = 请求头里的 Cookie 原文(验证请求真实携带)
+GET /storage-seed→ Web 存储种子页(document start 读 localStorage/sessionStorage 并回显)
+GET /storage-write→ 站点自己写 localStorage 的页(验证种子只填不覆盖)
 其余 /<file>     → test/fixture/ 下静态文件
 CORS:带 Origin 头的请求回 Access-Control-Allow-Origin:*,OPTIONS 预检放行
      (preflight 用例需要 127.0.0.1 → 127.0.0.2 跨源)
@@ -42,6 +44,32 @@ BIND_HOST = "127.0.0.1"
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
         ".webmanifest": "application/manifest+json", ".json": "application/json",
         ".png": "image/png"}
+
+# Web 存储种子用例页:head 里的脚本在"文档开始"处读一次,证明种子先于站点脚本落下
+# (只在导航后补写的实现,这里读到的会是 none)。正文写成纯文本节点,便于快照原样回读。
+STORAGE_SEED_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>storage-seed</title>
+<script>
+  window.__atLoad = {
+    token: localStorage.getItem('bu_e2e_token'),
+    sid: sessionStorage.getItem('bu_e2e_sid'),
+  };
+</script></head>
+<body><script>
+  document.body.textContent =
+    'storage-seed at-load token=' + (window.__atLoad.token ?? '(none)') +
+    ' sid=' + (window.__atLoad.sid ?? '(none)') +
+    ' now token=' + (localStorage.getItem('bu_e2e_token') ?? '(none)') +
+    ' sid=' + (sessionStorage.getItem('bu_e2e_sid') ?? '(none)');
+</script></body></html>"""
+
+# 会话内站点自己写值的页:再次回到 /storage-seed 时,种子不得把它覆盖回去
+STORAGE_WRITE_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>storage-write</title></head>
+<body><script>
+  localStorage.setItem('bu_e2e_token', 'page-written');
+  document.body.textContent = 'storage-write token=' + localStorage.getItem('bu_e2e_token');
+</script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -76,6 +104,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/echo-cookie":
             cookie = self.headers.get("Cookie", "(none)")
             self._send(200, f"echo-cookie: {cookie}",
+                       {"Content-Type": "text/html; charset=utf-8", **cors})
+        elif path == "/storage-seed":
+            self._send(200, STORAGE_SEED_PAGE,
+                       {"Content-Type": "text/html; charset=utf-8", **cors})
+        elif path == "/storage-write":
+            self._send(200, STORAGE_WRITE_PAGE,
                        {"Content-Type": "text/html; charset=utf-8", **cors})
         elif path == "/beacon":
             self._send(200, "beacon ok", cors)

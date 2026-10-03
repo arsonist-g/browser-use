@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Browser-Use Bridge",
-  "version": "0.1.0",
-  "description": "Browser-Use 专用桥:把日常浏览器的登录 cookie 提供给本机 Browser-Use daemon(127.0.0.1,自动连接)。",
-  "permissions": ["cookies", "storage", "alarms"],
-  "host_permissions": ["http://*/*", "https://*/*"],
+  "version": "0.2.0",
+  "description": "Browser-Use 专用桥:把日常浏览器的登录 cookie 与页内 Web 存储提供给本机 Browser-Use daemon(127.0.0.1,自动连接)。",
+  "permissions": ["cookies", "storage", "alarms", "scripting"],
+  "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "action": { "default_popup": "popup.html", "default_title": "Browser-Use Bridge" }
 }

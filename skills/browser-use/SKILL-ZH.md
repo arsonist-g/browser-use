@@ -1,13 +1,13 @@
 ---
 name: browser-use
-description: 通过 browser-use CLI 自动化需要登录态或受反爬检测保护的站点。它驱动本机真实的 Edge(有头),通过会话制注入继承用户日常浏览器的登录 cookie,不做任何指纹覆盖。适用于多步网页工作流(导航、快照、点击、填写)、页面检查(截图、console、network、性能追踪),以及在普通自动化会被检测到的站点上执行交互。
+description: 通过 browser-use CLI 自动化需要登录态或受反爬检测保护的站点。它驱动本机真实的 Edge(有头),通过会话制注入继承用户日常浏览器的登录态(cookie 与页内 Web 存储),不做任何指纹覆盖。适用于多步网页工作流(导航、快照、点击、填写)、页面检查(截图、console、network、性能追踪),以及在普通自动化会被检测到的站点上执行交互。
 ---
 
 <!-- 本文件是英文版译文,供人工校对;同目录的 SKILL.md(英文)是生效版本,两者逐句对应。 -->
 
 # browser-use
 
-`browser-use` 从 shell 操控真实浏览器。它启动本机自己的 Edge(有头、默认指纹),在会话启动时把用户日常浏览器的登录 cookie 注入一个一次性的隔离 profile,并以简单 CLI 命令驱动页面,覆盖交互、导航、检查、console、network、性能、内存等。其内核避开反爬系统能检测的协议级信号,因此在普通自动化会被检测的站点上仍可工作。
+`browser-use` 从 shell 操控真实浏览器。它启动本机自己的 Edge(有头、默认指纹),在会话启动时把用户日常浏览器的登录态(cookie 与它当前打开的站的页内 Web 存储)注入一个一次性的隔离 profile,并以简单 CLI 命令驱动页面,覆盖交互、导航、检查、console、network、性能、内存等。其内核避开反爬系统能检测的协议级信号,因此在普通自动化会被检测的站点上仍可工作。
 
 ## Output boundary
 
@@ -31,10 +31,10 @@ description: 通过 browser-use CLI 自动化需要登录态或受反爬检测�
 
 ## 登录态
 
-- `start` 在会话启动时从用户日常浏览器复制全量 cookie(含 httpOnly)。已登录站点无需输入凭证即可访问。
-- 注入成功时 `start` 打印 `login=injected`。日常浏览器未开或桥扩展未连接时,它打印登录提示并照常返回会话;此时你自行裁决:请用户打开日常浏览器,或任务不需要登录时运行 `browser-use session.bare --session=<id>`。
+- `start` 在会话启动时从用户日常浏览器复制登录态:全量 cookie(含 httpOnly),外加那台浏览器**当前打开着**的站的 `localStorage` / `sessionStorage`。已登录站点无需输入凭证即可访问。
+- 注入成功时 `start` 打印 `login=injected`,Web 存储一起到位时再打印 `storage=seeded(N origins, M keys)`。如果桥扩展未连接,`start` 会先把日常浏览器拉起来(扩展住在里面)并等它重连,成功时打印 `daily_browser=launched(…)`;桥仍未连则只打印登录提示并照常返回会话,此时你自行裁决:确认扩展已加载(`browser-use extension` 打印目录;`browser-use daily-browser` 重试整步),或任务不需要登录时运行 `browser-use session.bare --session=<id>`。
 - 多个会话共享同一套 cookie,行为等同人类开多个窗口:大多数平台视为同一设备,不触发强制下线。
-- 诚实边界:会话内的登出/改密操作同样作用于日常浏览器的同账号(与人类开第二个窗口一致);旋转 refresh token 的平台可能互踢一方;短时效登录 cookie 会过期,重开一个新会话即可。
+- 诚实边界:会话内的登出/改密操作同样作用于日常浏览器的同账号(与人类开第二个窗口一致);旋转 refresh token 的平台可能互踢一方;短时效登录 cookie 会过期,重开一个新会话即可;Web 存储只覆盖 `start` 那一刻日常浏览器开着标签页的源(扩展只能通过该源上已加载的页面读它的存储),只登录、没开标签页的站只有 cookie,把它开一次再重开会话即可;会话放在 IndexedDB 的站不在覆盖范围内。
 
 ## AI workflow
 
