@@ -291,8 +291,10 @@ usage:
             + "只含日常浏览器当前打开的标签页"
             + (w.truncated ? ";有源超出体积上限,部分键未搬运" : "") + ")");
         } else if (r.web_storage && r.web_storage.reported === false) {
-          // 扩展没回存储这一问 = 它还是 0.1.x;这不是故障,但登录态只在 localStorage 的站会一直登不上
-          out("storage=skipped(桥扩展还在 0.1.x,不搬 Web 存储;把扩展更新到 0.2.0 并在 edge://extensions 重新加载后,重开一个会话即可)");
+          // 扩展没回存储这一问 = 它跑的还是旧脚本:扩展还是 0.1.x,或者代码更新后没在扩展页重新加载。
+          // 后者是实测踩到的坑:重启浏览器不会重读 MV3 的 service worker 脚本,只有"重新加载"会。
+          out("storage=skipped(桥扩展没回 Web 存储:它还是 0.1.x,或者扩展代码更新后没在 edge://extensions"
+            + "点“重新加载”——重启浏览器不重读扩展脚本;处理完重开一个会话即可)");
         }
         if (r.warning) out(`warning: ${r.warning}`);
         return;

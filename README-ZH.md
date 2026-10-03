@@ -20,7 +20,7 @@ npm i -g @arsonist-g/browser-use
 browser-use doctor        # 检查 node >= 20、python 3.10+、DrissionPage 内核、Edge;--fix 自动补齐
 ```
 
-一次性配置:从 [GitHub Releases](https://github.com/arsonist-g/browser-use/releases/latest) 下载扩展压缩包并解压,再把对应目录装入日常 Edge;npm 包内也包含同一份扩展(`browser-use extension` 打印目录;`edge://extensions` → 开发者模式 → 加载解压缩的扩展)。日常浏览器处于打开状态时,扩展自动向新会话供给登录态:无需 token,无需反复点 popup。登录态含两部分——cookie 罐,以及你**当前打开着**的那些站的 `localStorage` / `sessionStorage`(相当一部分站把会话 token 放在这里);两者都在目标页自己的脚本执行之前种进会话。**已经装着旧扩展的话要重新加载一次**(`edge://extensions` → 重新加载该目录),它才有存储那半。日常浏览器没开也不需要你记着去开:桥不可达时 `browser-use start` 会自己把日常浏览器拉起来并等扩展重连(`browser-use daily-browser` 可单独跑这一步;`config set daily_browser_autostart false` 关掉自动那半)。
+一次性配置:从 [GitHub Releases](https://github.com/arsonist-g/browser-use/releases/latest) 下载扩展压缩包并解压,再把对应目录装入日常 Edge;npm 包内也包含同一份扩展(`browser-use extension` 打印目录;`edge://extensions` → 开发者模式 → 加载解压缩的扩展)。日常浏览器处于打开状态时,扩展自动向新会话供给登录态:无需 token,无需反复点 popup。登录态含两部分——cookie 罐,以及你**当前打开着**的那些站的 `localStorage` / `sessionStorage`(相当一部分站把会话 token 放在这里);两者都在目标页自己的脚本执行之前种进会话。**已经装着旧扩展的话要重新加载一次**(`edge://extensions` → 重新加载该目录),它才有存储那半。要重新加载的是**扩展本身,不是浏览器**:实测 Chromium 会把旧的 service worker 脚本带过一次完整的浏览器重启,只有扩展页的"重新加载"才会让它重读目录。日常浏览器没开也不需要你记着去开:桥不可达时 `browser-use start` 会自己把日常浏览器拉起来并等扩展重连(`browser-use daily-browser` 可单独跑这一步;`config set daily_browser_autostart false` 关掉自动那半)。
 
 ## 30 秒上手
 
