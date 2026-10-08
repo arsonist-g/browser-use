@@ -71,15 +71,19 @@ function drawIcon(state) {
 const STORAGE_ORIGIN_MAX_BYTES = 1024 * 1024;
 const STORAGE_TOTAL_MAX_BYTES = 4 * 1024 * 1024;
 // 采集预算:每个被采集的标签页必须在这段时间内回话,不回话就当它卡住(崩掉的、被冻结的、
-// 挂着对话框的页都长这样)。卡住的标签页记进 stuckTabs,本轮与后续轮都不再碰它(标签页关掉即移出);
-// 注入按波并发(见 WAVE_SIZE),所以一个卡住的页只占住自己那一格预算,不会排队挡住后面的页。
+// 挂着对话框的页都长这样)。卡住的标签页进 stuckTabs 并冷却一段时间,冷却期内本轮与后续轮都不再碰它
+// (标签页关掉即移出);注入按波并发(见 WAVE_SIZE),所以一个卡住的页只占住自己那一格预算,不会排队挡住后面的页。
 // 这些值只决定"存储这半最多拖多久" —— cookie 在采集之前就已经单独回给 daemon 了,不在这条路上等。
 const STORAGE_TAB_TIMEOUT_MS = 800;
 const STORAGE_TOTAL_BUDGET_MS = 3000;
 const STORAGE_WAVE_SIZE = 8;
-const stuckTabs = new Set();
+// 冷却而不是永久拉黑:实测 service worker 会靠着 WS 常连活很久,永久拉黑等于让那些源在整个 SW
+// 生命里一直采不到 —— 而它们可能只是当时忙(会话冷启动那几秒机器很重),或者已被点开过(点开会解冻页面)。
+// 冷却到期后重试的代价有上界:一轮最多花掉一个整轮预算。
+const STORAGE_STUCK_COOLDOWN_MS = 10 * 60 * 1000;
+const stuckTabs = new Map(); // tabId → 可再次尝试的时刻
 
-/** 回归钩子:单测(假 chrome + vm)把上面的预算压到毫秒级;浏览器里没有这三个键,取默认值。 */
+/** 回归钩子:单测(假 chrome + vm)把上面的预算压到毫秒级;浏览器里没有这几个键,取默认值。 */
 function budgetOverride(key, fallback) {
   const v = globalThis[key];
   return typeof v === "number" && v > 0 ? v : fallback;
@@ -125,6 +129,7 @@ async function harvestWebStorage() {
   const tabTimeoutMs = budgetOverride("__BU_STORAGE_TAB_TIMEOUT_MS", STORAGE_TAB_TIMEOUT_MS);
   const budgetMs = budgetOverride("__BU_STORAGE_TOTAL_BUDGET_MS", STORAGE_TOTAL_BUDGET_MS);
   const waveSize = Math.max(1, Math.floor(budgetOverride("__BU_STORAGE_WAVE_SIZE", STORAGE_WAVE_SIZE)));
+  const cooldownMs = budgetOverride("__BU_STORAGE_STUCK_COOLDOWN_MS", STORAGE_STUCK_COOLDOWN_MS);
   const startedAt = Date.now();
   const stats = { tabs: 0, read: 0, origins: 0, bytes: 0, truncated: false,
     timed_out: 0, skipped_stuck: 0, budget_exhausted: false, errors: [] };
@@ -144,7 +149,8 @@ async function harvestWebStorage() {
     if (tab.discarded) continue; // 已丢弃的标签页没有渲染进程:注入会把它唤醒重载,是额外副作用
     if (!/^https?:\/\//i.test(String(tab.url ?? ""))) continue;
     present.add(tab.id);
-    if (stuckTabs.has(tab.id)) { stats.skipped_stuck += 1; continue; } // 它上一轮没回话,不再重试
+    const retryAt = stuckTabs.get(tab.id);
+    if (retryAt && retryAt > Date.now()) { stats.skipped_stuck += 1; continue; } // 冷却期内不再试它
     candidates.push(tab);
   }
   // 分波并发注入:一轮等待 = 最慢的那一格,而不是所有页之和。串行时(0.2.1 首版)四个不回话的页
@@ -161,7 +167,7 @@ async function harvestWebStorage() {
       } catch (e) {
         if (e && e.__storageTimeout) {
           stats.timed_out += 1;
-          stuckTabs.add(tab.id);
+          stuckTabs.set(tab.id, Date.now() + cooldownMs);
         } else {
           stats.errors.push(String(e)); // 页面已丢弃/受保护/权限自定站点:跳过该页,不中断整轮
         }
@@ -185,7 +191,7 @@ async function harvestWebStorage() {
     }
   }
   // 已经不在了的标签页从记忆里去掉:免得它下次再出现时被一份过期的判断误伤
-  for (const id of [...stuckTabs]) if (!present.has(id)) stuckTabs.delete(id);
+  for (const id of [...stuckTabs.keys()]) if (!present.has(id)) stuckTabs.delete(id);
   const origins = [];
   let used = 0;
   for (const acc of byOrigin.values()) {

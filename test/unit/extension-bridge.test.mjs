@@ -70,6 +70,7 @@ function loadBridge({ tabs = [], results = {}, cookies = [], budgets = {} } = {}
     __BU_STORAGE_TAB_TIMEOUT_MS: budgets.tab,
     __BU_STORAGE_TOTAL_BUDGET_MS: budgets.total,
     __BU_STORAGE_WAVE_SIZE: budgets.wave,
+    __BU_STORAGE_STUCK_COOLDOWN_MS: budgets.cooldown,
   };
   vm.createContext(sandbox);
   try {
@@ -196,6 +197,27 @@ test("卡住的页不再挡住同一轮里的其它页(分波并发)", async () 
   assert.equal(stats.budget_exhausted, false);
   assert.deepEqual(msgs[1].storage, [{ origin: "https://ok.example", local: { a: "1" }, session: {} }],
     "串行实现里健康页会排在两个卡住的页之后、永远轮不到");
+});
+
+test("卡住的页在冷却期内被跳过,冷却到期后重新参与采集(不是永久拉黑)", async () => {
+  const { askAll } = loadBridge({
+    cookies: [],
+    tabs: [{ id: 1, url: "https://stuck.example/" }],
+    results: { 1: "HANG" },
+    // service worker 会靠 WS 常连活很久,永久拉黑 = 这个源在整个 SW 生命里都采不到
+    budgets: { tab: 40, cooldown: 40 },
+  });
+  const first = await askAll({ type: "getCookies", reqId: "r9", wantStorage: true });
+  assert.equal(first[1].storageStats.timed_out, 1);
+
+  const second = await askAll({ type: "getCookies", reqId: "r10", wantStorage: true });
+  assert.equal(second[1].storageStats.skipped_stuck, 1, "冷却期内跳过");
+  assert.equal(second[1].storageStats.tabs, 0, "不为它花预算");
+
+  await new Promise((r) => setTimeout(r, 60)); // 越过冷却
+  const third = await askAll({ type: "getCookies", reqId: "r11", wantStorage: true });
+  assert.equal(third[1].storageStats.timed_out, 1, "冷却到期后重新试它");
+  assert.equal(third[1].storageStats.skipped_stuck, 0);
 });
 
 test("整轮预算用尽:带着已采到的部分收工,budget_exhausted 如实置位", async () => {

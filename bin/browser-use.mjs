@@ -231,7 +231,7 @@ function storageLine(w) {
   }
   if (gaveUp.length || w.timed_out) {
     return `storage=timeout(${gaveUp.length ? gaveUp.join("、") : "桥未在预算内回存储"};本轮没搬存储,`
-      + "cookie 已照常注入。处理:关掉或刷新那个卡住的标签页,再重开一个会话)";
+      + "cookie 已照常注入。处理:把这些页点开或关掉(点开会解冻页面),或重开一个会话)";
   }
   if (w.reported === false) {
     // 扩展没回存储这一问 = 它跑的还是旧脚本:扩展还是 0.1.x,或者代码更新后没在扩展页重新加载。
