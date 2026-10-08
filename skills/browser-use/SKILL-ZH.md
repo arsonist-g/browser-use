@@ -32,7 +32,7 @@ description: 通过 browser-use CLI 自动化需要登录态或受反爬检测�
 ## 登录态
 
 - `start` 在会话启动时从用户日常浏览器复制登录态:全量 cookie(含 httpOnly),外加那台浏览器**当前打开着**的站的 `localStorage` / `sessionStorage`。已登录站点无需输入凭证即可访问。
-- 注入成功时 `start` 打印 `login=injected`,Web 存储一起到位时再打印 `storage=seeded(N origins, M keys)`。如果桥扩展未连接,`start` 会先把日常浏览器拉起来(扩展住在里面)并等它重连,成功时打印 `daily_browser=launched(…)`;桥仍未连则只打印登录提示并照常返回会话,此时你自行裁决:确认扩展已加载(`browser-use extension` 打印目录;`browser-use daily-browser` 重试整步),或任务不需要登录时运行 `browser-use session.bare --session=<id>`。
+- 注入成功时 `start` 打印 `login=injected`,Web 存储一起到位时再打印 `storage=seeded(N origins, M keys)`。cookie 与 Web 存储分两步采集、分开报账:采存储时日常浏览器里有标签页不回话(崩掉的、被冻结的、挂着对话框的页都可能这样),`start` 仍然打印 `login=injected`,多一行 `storage=timeout(…)` 说明跳过了几个标签页 —— 那些标签页上的源这一轮就是没搬,后续会话也会跳过它们,直到那些页被关掉或刷新。如果桥扩展未连接,`start` 会先把日常浏览器拉起来(扩展住在里面)并等它重连,成功时打印 `daily_browser=launched(…)`;桥仍未连则只打印登录提示并照常返回会话,此时你自行裁决:确认扩展已加载(`browser-use extension` 打印目录;`browser-use daily-browser` 重试整步),或任务不需要登录时运行 `browser-use session.bare --session=<id>`。
 - 多个会话共享同一套 cookie,行为等同人类开多个窗口:大多数平台视为同一设备,不触发强制下线。
 - 诚实边界:会话内的登出/改密操作同样作用于日常浏览器的同账号(与人类开第二个窗口一致);旋转 refresh token 的平台可能互踢一方;短时效登录 cookie 会过期,重开一个新会话即可;Web 存储只覆盖 `start` 那一刻日常浏览器开着标签页的源(扩展只能通过该源上已加载的页面读它的存储),只登录、没开标签页的站只有 cookie,把它开一次再重开会话即可;会话放在 IndexedDB 的站不在覆盖范围内。
 

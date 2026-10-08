@@ -199,6 +199,49 @@ function fmtResult(tool, r) {
 }
 
 // ---- commands ----
+/**
+ * 登录态为空时的提示语。"桥没回话"与"扩展没连上"是两回事:前者桥是连着的、只是这次没答,
+// 说成后者会把人引去重装扩展(2026-10-08 现场就是这样走偏的)。
+ */
+function loginHint(r) {
+  if (String(r.login_error ?? "").startsWith("BRIDGE_TIMEOUT")) {
+    return `提示: 桥扩展连着,但这次没回话(${r.login_error})——通常是扩展侧卡住或忙,重开一个会话多半就好;`
+      + `不需要登录时 browser-use session.bare --session=${r.session_id} 跳过。`;
+  }
+  return `提示: 未取得登录态。任务需要登录时:确认日常浏览器已打开、桥扩展已加载(browser-use extension 打印目录,`
+    + `popup 显示已连接),或用 browser-use daily-browser 重试拉起;不需要登录时 `
+    + `browser-use session.bare --session=${r.session_id} 跳过。`;
+}
+
+/**
+ * start 输出的存储那一行:采到什么就说什么,采集提前结束(某个标签页没回话/预算用尽)如实标出。
+ * cookie 与存储是两条独立链路 —— 存储没搬上不影响 login=injected。
+ */
+function storageLine(w) {
+  if (!w) return null;
+  const gaveUp = [];
+  if (w.stuck_tabs > 0) gaveUp.push(`${w.stuck_tabs} 个标签页没回话`);
+  if (w.skipped_stuck > 0) gaveUp.push(`${w.skipped_stuck} 个此前没回话、本轮已跳过`);
+  if (w.budget_exhausted) gaveUp.push("本轮采集总预算用尽");
+  const size = w.truncated ? ";有源超出体积上限,部分键未搬运" : "";
+  if (w.injected) {
+    return `storage=seeded(localStorage/sessionStorage 已种入 ${w.origins} 个源、${w.entries} 个键;`
+      + `只含日常浏览器当前打开的标签页${size}`
+      + (gaveUp.length ? `;采集提前结束(${gaveUp.join("、")}),未走到的源这次没搬` : "") + ")";
+  }
+  if (gaveUp.length || w.timed_out) {
+    return `storage=timeout(${gaveUp.length ? gaveUp.join("、") : "桥未在预算内回存储"};本轮没搬存储,`
+      + "cookie 已照常注入。处理:关掉或刷新那个卡住的标签页,再重开一个会话)";
+  }
+  if (w.reported === false) {
+    // 扩展没回存储这一问 = 它跑的还是旧脚本:扩展还是 0.1.x,或者代码更新后没在扩展页重新加载。
+    // 后者是实测踩到的坑:重启浏览器不会重读 MV3 的 service worker 脚本,只有"重新加载"会。
+    return "storage=skipped(桥扩展没回 Web 存储:它还是 0.1.x,或者扩展代码更新后没在 edge://extensions"
+      + "点“重新加载”——重启浏览器不重读扩展脚本;处理完重开一个会话即可)";
+  }
+  return null; // 扩展采了但没源可搬(日常浏览器没有打开着的 http(s) 标签页):不必多一行
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   // 通用解析:--flag value / --boolFlag / 位置参数(工具参数各异,不再逐一声明)
@@ -284,18 +327,9 @@ usage:
         out(`session=${r.session_id}`);
         if (r.daily_browser?.launched) out("daily_browser=launched(日常浏览器未打开,已自动拉起)");
         if (r.login_state === "injected") out("login=injected(登录态已注入)");
-        else out(`login=${r.login_state}\n提示: 未取得登录态。任务需要登录时:确认日常浏览器已打开、桥扩展已加载(browser-use extension 打印目录,popup 显示已连接),或用 browser-use daily-browser 重试拉起;不需要登录时 browser-use session.bare --session=${r.session_id} 跳过。`);
-        if (r.web_storage?.injected) {
-          const w = r.web_storage;
-          out(`storage=seeded(localStorage/sessionStorage 已种入 ${w.origins} 个源、${w.entries} 个键;`
-            + "只含日常浏览器当前打开的标签页"
-            + (w.truncated ? ";有源超出体积上限,部分键未搬运" : "") + ")");
-        } else if (r.web_storage && r.web_storage.reported === false) {
-          // 扩展没回存储这一问 = 它跑的还是旧脚本:扩展还是 0.1.x,或者代码更新后没在扩展页重新加载。
-          // 后者是实测踩到的坑:重启浏览器不会重读 MV3 的 service worker 脚本,只有"重新加载"会。
-          out("storage=skipped(桥扩展没回 Web 存储:它还是 0.1.x,或者扩展代码更新后没在 edge://extensions"
-            + "点“重新加载”——重启浏览器不重读扩展脚本;处理完重开一个会话即可)");
-        }
+        else out(`login=${r.login_state}\n${loginHint(r)}`);
+        const storage = storageLine(r.web_storage);
+        if (storage) out(storage);
         if (r.warning) out(`warning: ${r.warning}`);
         return;
       }

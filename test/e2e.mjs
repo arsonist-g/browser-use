@@ -779,24 +779,40 @@ async function webStorageSection() {
   try {
     fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({
       port_range: [18570, 18620], daemon_http_port: daemonPort, bridge_ws_port: bridgePort,
-      daily_browser_autostart: false,
+      daily_browser_autostart: false, storage_wait_ms: 400,
     }));
     const st = run(["status", "--output-format=json"]);
     ok("web-storage daemon 起在隔离 home", st.status === 0, (st.stderr || "").slice(0, 160));
 
-    // 假桥 = 扩展的 daemon 侧那一半:回 cookie + storage(采集本身不在这里测)
+    // 假桥 = 扩展的 daemon 侧那一半(采集本身不在这里测)。两种协商形态各演一遍:
+    // legacy = 协商 1,存储捎在 cookie 回复里;proto2 = 协商 2,存储单独一条消息。
+    const seedLocal = { bu_e2e_token: "bu-e2e-seed-1" };
+    const seedSession = { bu_e2e_sid: "bu-e2e-session-1" };
+    const seedStorage = [{ origin: BASE, local: seedLocal, session: seedSession }];
+    const seedStats = { tabs: 1, read: 1, origins: 1, bytes: 64, truncated: false,
+      timed_out: 0, skipped_stuck: 0, budget_exhausted: false, errors: [] };
+    // 协商 2 那一轮用的 cookie:非空才能断言 login=injected(采集卡住不该牵连 cookie 这半)
+    const COOKIE = { name: "bu_e2e_sid", value: "bu-e2e-1", domain: "127.0.0.1", path: "/",
+      secure: false, httpOnly: false };
+    let mode = "legacy";
+    let silent = false; // 协商 2 下:存储那条永不来(模拟扩展的采集卡在某个标签页上)
     const asked = [];
     bridge = new WebSocket(`ws://127.0.0.1:${bridgePort}/?proto=1`);
     bridge.on("message", (raw) => {
       const m = JSON.parse(raw.toString());
       if (m.type !== "getCookies") return;
       asked.push(m);
-      bridge.send(JSON.stringify({
-        type: "cookies", reqId: m.reqId, data: [],
-        storage: [{ origin: BASE, local: { bu_e2e_token: "bu-e2e-seed-1" },
-          session: { bu_e2e_sid: "bu-e2e-session-1" } }],
-        storageStats: { tabs: 1, read: 1, origins: 1, bytes: 64, truncated: false, errors: [] },
-      }));
+      if (mode === "legacy") {
+        bridge.send(JSON.stringify({
+          type: "cookies", reqId: m.reqId, data: [],
+          storage: seedStorage, storageStats: seedStats,
+        }));
+        return;
+      }
+      bridge.send(JSON.stringify({ type: "cookies", reqId: m.reqId, data: [COOKIE] }));
+      if (!silent) {
+        bridge.send(JSON.stringify({ type: "storage", reqId: m.reqId, storage: seedStorage, storageStats: seedStats }));
+      }
     });
     await once(bridge, "open");
 
@@ -827,6 +843,27 @@ async function webStorageSection() {
       const stopped = run(["stop", "--session", stSession]);
       ok("web-storage 会话可正常 stop", stopped.stdout.includes("state=cleaned"), stopped.stdout.slice(0, 120));
       stSession = null;
+    }
+
+    // ---- 采集卡住时的降级(2026-10-08 现场:一个不回话的标签页曾让整次注入超时) ----
+    // 协商 2 的扩展把 cookie 单独先回、存储那条永不来:cookie 必须照常注入,存储如实报 timeout。
+    // 这里断言的是人读的那几行(用户看到的就是它),所以不带 --output-format=json。
+    mode = "proto2";
+    silent = true;
+    bridge.send(JSON.stringify({ type: "hello", proto: 1, extVersion: "0.2.1", storageProto: 2 }));
+    await new Promise((r) => setTimeout(r, 200)); // 让 daemon 记下协商版本
+    const stuckStart = await runAsync(["start"]);
+    const stuckSession = (stuckStart.stdout.match(/session=(\S+)/) ?? [])[1] ?? null;
+    liveBrowser = liveBrowser || !!stuckSession;
+    ok("存储采集卡住:cookie 照常注入(不再退回 login=empty)",
+      stuckStart.stdout.includes("login=injected") && !stuckStart.stdout.includes("login=empty"),
+      stuckStart.stdout.split("\n").slice(0, 4).join(" | ").slice(0, 220));
+    ok("存储采集卡住:存储如实报 timeout(不报成扩展没装/没连)",
+      stuckStart.stdout.includes("storage=timeout(") && !stuckStart.stdout.includes("storage=skipped("),
+      stuckStart.stdout.split("\n").filter((l) => l.startsWith("storage=")).join(" | ").slice(0, 220));
+    if (stuckSession) {
+      const stopped2 = run(["stop", "--session", stuckSession]);
+      ok("采集卡住那一轮的会话可正常 stop", stopped2.stdout.includes("state=cleaned"), stopped2.stdout.slice(0, 120));
     }
   } finally {
     try { bridge?.close(); } catch { /* */ }

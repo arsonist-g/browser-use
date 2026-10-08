@@ -70,6 +70,33 @@ function drawIcon(state) {
 // 上限只为防一个巨型站点把 WS 消息撑爆;触发即置 truncated,由调用方如实转述,不静默丢弃。
 const STORAGE_ORIGIN_MAX_BYTES = 1024 * 1024;
 const STORAGE_TOTAL_MAX_BYTES = 4 * 1024 * 1024;
+// 采集预算:每个被采集的标签页必须在这段时间内回话,不回话就当它卡住(崩掉的、被冻结的、
+// 挂着对话框的页都长这样)。卡住的标签页记进 stuckTabs,本轮与后续轮都不再碰它(标签页关掉即移出);
+// 整轮再压一个总预算,到点就带着已采到的部分收工。两个值只决定"存储这半最多拖多久" ——
+// cookie 在采集之前就已经单独回给 daemon 了,不在这条路上等。
+const STORAGE_TAB_TIMEOUT_MS = 800;
+const STORAGE_TOTAL_BUDGET_MS = 3000;
+const stuckTabs = new Set();
+
+/** 回归钩子:单测(假 chrome + vm)把上面的预算压到毫秒级;浏览器里没有这两个键,取默认值。 */
+function budgetOverride(key, fallback) {
+  const v = globalThis[key];
+  return typeof v === "number" && v > 0 ? v : fallback;
+}
+
+/** 给一次注入加预算:到点以 __storageTimeout 标记的错拒绝;原 promise 迟到的失败由自己接下,不冒泡。 */
+function withTimeout(promise, ms) {
+  promise.catch(() => {});
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(Object.assign(new Error(`该标签页 ${ms}ms 内没回话`), { __storageTimeout: true }));
+      }, ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
 
 /** 页内函数(经 chrome.scripting 注入执行):原样导出两个 storage 的键值。 */
 function readWebStorage() {
@@ -94,7 +121,11 @@ function readWebStorage() {
 
 /** 采一份 Web 存储快照:遍历打开的标签页 → 逐页注入读取 → 按 origin 合并 + 上限裁剪。 */
 async function harvestWebStorage() {
-  const stats = { tabs: 0, read: 0, origins: 0, bytes: 0, truncated: false, errors: [] };
+  const tabTimeoutMs = budgetOverride("__BU_STORAGE_TAB_TIMEOUT_MS", STORAGE_TAB_TIMEOUT_MS);
+  const budgetMs = budgetOverride("__BU_STORAGE_TOTAL_BUDGET_MS", STORAGE_TOTAL_BUDGET_MS);
+  const startedAt = Date.now();
+  const stats = { tabs: 0, read: 0, origins: 0, bytes: 0, truncated: false,
+    timed_out: 0, skipped_stuck: 0, budget_exhausted: false, errors: [] };
   const byOrigin = new Map();
   let tabs = [];
   try {
@@ -103,20 +134,27 @@ async function harvestWebStorage() {
     stats.errors.push(String(e));
     return { origins: [], stats };
   }
+  const present = new Set();
   for (const tab of tabs) {
     // tab.url 只在扩展有该页 host 权限时才有值(manifest 已 <all_urls>);非 http(s) 与本桥无关
     if (!tab || typeof tab.id !== "number") continue;
     if (tab.discarded) continue; // 已丢弃的标签页没有渲染进程:注入会把它唤醒重载,是额外副作用
     if (!/^https?:\/\//i.test(String(tab.url ?? ""))) continue;
+    present.add(tab.id);
+    if (stuckTabs.has(tab.id)) { stats.skipped_stuck += 1; continue; } // 它上一轮没回话,不再重试
+    if (Date.now() - startedAt >= budgetMs) { stats.budget_exhausted = true; break; }
     stats.tabs += 1;
     let results;
     try {
-      results = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: readWebStorage,
-      });
+      results = await withTimeout(
+        chrome.scripting.executeScript({ target: { tabId: tab.id }, func: readWebStorage }), tabTimeoutMs);
     } catch (e) {
-      stats.errors.push(String(e)); // 页面已丢弃/受保护/权限自定站点:跳过该页,不中断整轮
+      if (e && e.__storageTimeout) {
+        stats.timed_out += 1;
+        stuckTabs.add(tab.id);
+      } else {
+        stats.errors.push(String(e)); // 页面已丢弃/受保护/权限自定站点:跳过该页,不中断整轮
+      }
       continue;
     }
     for (const r of results ?? []) {
@@ -133,6 +171,8 @@ async function harvestWebStorage() {
       byOrigin.set(rec.origin, acc);
     }
   }
+  // 已经不在了的标签页从记忆里去掉:免得它下次再出现时被一份过期的判断误伤
+  for (const id of [...stuckTabs]) if (!present.has(id)) stuckTabs.delete(id);
   const origins = [];
   let used = 0;
   for (const acc of byOrigin.values()) {
@@ -167,6 +207,13 @@ function capBytes(rec, maxBytes) {
   return { rec: out, truncated };
 }
 
+/** 发一条消息:采集要遍历标签页、可能花掉几秒,期间连接可能已经断了 —— 迟到的那条丢掉,不把整段处理带崩。 */
+function send(payload) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  } catch (e) { /* */ }
+}
+
 async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   // 无感配对(DEC-012):回环即信任,daemon 在线即自动连接,零交互
@@ -180,7 +227,11 @@ async function connect() {
   ws.onopen = () => {
     backoffMs = 1000;
     drawIcon("connected");
-    try { ws.send(JSON.stringify({ type: "hello", proto: 1, extVersion: chrome.runtime.getManifest().version })); } catch (e) { /* */ }
+    // storageProto=2:存储走单独一条 storage 消息,不再与 cookie 同一条回复(协商 1 = 旧扩展的捎带形态)
+    try {
+      ws.send(JSON.stringify({ type: "hello", proto: 1, extVersion: chrome.runtime.getManifest().version,
+        storageProto: 2 }));
+    } catch (e) { /* */ }
   };
   ws.onmessage = async (ev) => {
     let m;
@@ -188,23 +239,21 @@ async function connect() {
     if (m.type === "getCookies") {
       try {
         const data = await chrome.cookies.getAll({});
-        const reply = { type: "cookies", reqId: m.reqId, data };
-        // wantStorage 由 daemon 显式要求才采(旧 daemon 不带该字段 → 本次往返仍是纯 cookie);
-        // 采集失败只丢 storage 字段,cookie 必须照常送回(两者是两条独立的登录态来源)
-        if (m.wantStorage) {
-          try {
-            const s = await harvestWebStorage();
-            reply.storage = s.origins;
-            reply.storageStats = s.stats;
-          } catch (e) {
-            reply.storage = [];
-            reply.storageStats = { tabs: 0, read: 0, origins: 0, bytes: 0, truncated: false,
-              errors: [String(e)] };
-          }
+        // cookie 先单独送:它 100ms 内就能拿到,而采存储要遍历标签页、可能耗上几秒,还可能卡在
+        // 某个不回话的页上。两条分开送,存储出任何问题都不会再牵连 cookie(2026-10-08 现场:
+        // 同一条回复时,一个卡住的标签页让整次注入超时,start 报 login=empty)。
+        send({ type: "cookies", reqId: m.reqId, data });
+        if (!m.wantStorage) return;
+        let s;
+        try {
+          s = await harvestWebStorage();
+        } catch (e) {
+          s = { origins: [], stats: { tabs: 0, read: 0, origins: 0, bytes: 0, truncated: false,
+            timed_out: 0, skipped_stuck: 0, budget_exhausted: false, errors: [String(e)] } };
         }
-        ws.send(JSON.stringify(reply));
+        send({ type: "storage", reqId: m.reqId, storage: s.origins, storageStats: s.stats });
       } catch (e) {
-        ws.send(JSON.stringify({ type: "error", reqId: m.reqId, message: String(e) }));
+        send({ type: "error", reqId: m.reqId, message: String(e) });
       }
     } else if (m.type === "ping") {
       ws.send(JSON.stringify({ type: "pong" }));
