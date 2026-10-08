@@ -221,13 +221,13 @@ function storageLine(w) {
   if (!w) return null;
   const gaveUp = [];
   if (w.stuck_tabs > 0) gaveUp.push(`${w.stuck_tabs} 个标签页没回话`);
-  if (w.skipped_stuck > 0) gaveUp.push(`${w.skipped_stuck} 个此前没回话、本轮已跳过`);
-  if (w.budget_exhausted) gaveUp.push("本轮采集总预算用尽");
+  if (w.skipped_stuck > 0) gaveUp.push(`另跳过 ${w.skipped_stuck} 个此前没回话的`);
+  if (w.budget_exhausted) gaveUp.push("本轮预算用尽");
   const size = w.truncated ? ";有源超出体积上限,部分键未搬运" : "";
   if (w.injected) {
     return `storage=seeded(localStorage/sessionStorage 已种入 ${w.origins} 个源、${w.entries} 个键;`
       + `只含日常浏览器当前打开的标签页${size}`
-      + (gaveUp.length ? `;采集提前结束(${gaveUp.join("、")}),未走到的源这次没搬` : "") + ")";
+      + (gaveUp.length ? `;采集提前结束:${gaveUp.join("、")},未走到的源这次没搬` : "") + ")";
   }
   if (gaveUp.length || w.timed_out) {
     return `storage=timeout(${gaveUp.length ? gaveUp.join("、") : "桥未在预算内回存储"};本轮没搬存储,`

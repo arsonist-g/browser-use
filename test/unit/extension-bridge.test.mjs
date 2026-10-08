@@ -69,6 +69,7 @@ function loadBridge({ tabs = [], results = {}, cookies = [], budgets = {} } = {}
     OffscreenCanvas: undefined,
     __BU_STORAGE_TAB_TIMEOUT_MS: budgets.tab,
     __BU_STORAGE_TOTAL_BUDGET_MS: budgets.total,
+    __BU_STORAGE_WAVE_SIZE: budgets.wave,
   };
   vm.createContext(sandbox);
   try {
@@ -176,6 +177,27 @@ test("标签页不回话:cookie 照常先回,该页记 timed_out 且后续轮不
   assert.ok(Date.now() - started < 40, `跳过卡住的页后这一轮应当很快,实测 ${Date.now() - started}ms`);
 });
 
+test("卡住的页不再挡住同一轮里的其它页(分波并发)", async () => {
+  const { askAll } = loadBridge({
+    cookies: [],
+    tabs: [
+      { id: 1, url: "https://stuck1.example/" },
+      { id: 2, url: "https://stuck2.example/" },
+      { id: 3, url: "https://ok.example/" },
+    ],
+    results: { 1: "HANG", 2: "HANG", 3: [{ result: { origin: "https://ok.example", local: { a: "1" }, session: {} } }] },
+    // 预算只够串行跑掉两个卡住的页;并发时它们与健康页同在一波,健康页照常采到
+    budgets: { tab: 60, total: 120 },
+  });
+  const msgs = await askAll({ type: "getCookies", reqId: "r7", wantStorage: true });
+  const stats = msgs[1].storageStats;
+  assert.equal(stats.tabs, 3, "三个页在同一波里都注入了");
+  assert.equal(stats.timed_out, 2);
+  assert.equal(stats.budget_exhausted, false);
+  assert.deepEqual(msgs[1].storage, [{ origin: "https://ok.example", local: { a: "1" }, session: {} }],
+    "串行实现里健康页会排在两个卡住的页之后、永远轮不到");
+});
+
 test("整轮预算用尽:带着已采到的部分收工,budget_exhausted 如实置位", async () => {
   const { askAll } = loadBridge({
     cookies: [],
@@ -185,9 +207,9 @@ test("整轮预算用尽:带着已采到的部分收工,budget_exhausted 如实�
       { id: 3, url: "https://never-reached.example/" },
     ],
     results: { 1: "HANG", 2: "HANG", 3: [{ result: { origin: "https://never-reached.example", local: { a: "1" }, session: {} } }] },
-    budgets: { tab: 40, total: 60 },
+    budgets: { tab: 40, total: 60, wave: 1 }, // 波宽 1 = 串行:用来确定性地走到预算用尽那条路
   });
-  const msgs = await askAll({ type: "getCookies", reqId: "r6", wantStorage: true });
+  const msgs = await askAll({ type: "getCookies", reqId: "r8", wantStorage: true });
   const stats = msgs[1].storageStats;
   assert.equal(stats.budget_exhausted, true);
   assert.equal(stats.timed_out, 2);
